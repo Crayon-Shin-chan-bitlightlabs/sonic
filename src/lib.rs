@@ -68,4 +68,4 @@ pub use ledger::{AcceptError, Ledger};
 #[cfg(feature = "binfile")]
 pub use ledger::{DEEDS_MAGIC_NUMBER, DEEDS_VERSION};
 pub use state::{EffectiveState, ProcessedState, RawState, Transition};
-pub use stock::{IssueError, Stock};
+pub use stock::{IssueError, Stock, StockSession};

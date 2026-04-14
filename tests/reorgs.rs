@@ -250,7 +250,7 @@ fn setup(name: &str) -> LedgerDir {
     ledger
 }
 
-fn graph(name: &str, ledger: &LedgerDir) {
+fn graph(name: &str, ledger: &mut LedgerDir) {
     let mut graph = Graph::<(String, bool), ()>::new();
     let genesis_opid = ledger.articles().genesis_opid();
     let mut nodes = bmap! {
@@ -286,7 +286,7 @@ fn no_reorgs() {
     dump_ledger("tests/data/NoReorgs.contract", "tests/data/NoReorgs.dump", true).unwrap();
 }
 
-fn check_rollback(ledger: LedgerDir, mut removed: IndexSet<Operation>) -> IndexSet<Operation> {
+fn check_rollback(mut ledger: LedgerDir, mut removed: IndexSet<Operation>) -> IndexSet<Operation> {
     let opids = removed.iter().map(|op| op.opid()).collect::<BTreeSet<_>>();
 
     let mut index = 0usize;
@@ -343,7 +343,7 @@ fn single_rollback() {
     println!("Rolling back {mid_opid} and its descendants");
     ledger.rollback([mid_opid]).unwrap();
     dump_ledger("tests/data/SingleRollback.contract", "tests/data/SingleRollback.dump", true).unwrap();
-    graph("SingleRollback", &ledger);
+    graph("SingleRollback", &mut ledger);
     check_rollback(ledger, indexset![mid_op]);
 }
 
@@ -355,7 +355,7 @@ fn double_rollback() {
     println!("Rolling back {mid_opid1}, {mid_opid2} and their descendants");
     ledger.rollback([mid_opid1, mid_opid2]).unwrap();
     dump_ledger("tests/data/DoubleRollback.contract", "tests/data/DoubleRollback.dump", true).unwrap();
-    graph("DoubleRollback", &ledger);
+    graph("DoubleRollback", &mut ledger);
     check_rollback(ledger, indexset![mid_op1, mid_op2]);
 }
 
@@ -369,7 +369,7 @@ fn two_rollbacks() {
     println!("Rolling back {mid_opid2} and its descendants");
     ledger.rollback([mid_opid2]).unwrap();
     dump_ledger("tests/data/TwoRollbacks.contract", "tests/data/TwoRollbacks.dump", true).unwrap();
-    graph("TwoRollbacks", &ledger);
+    graph("TwoRollbacks", &mut ledger);
     check_rollback(ledger, indexset![mid_op1, mid_op2]);
 }
 
@@ -383,7 +383,7 @@ fn rollback_forward() {
     println!("Applying {mid_opid} and its descendants back");
     ledger.forward([mid_opid]).unwrap();
     dump_ledger("tests/data/RollbackForward.contract", "tests/data/RollbackForward.dump", true).unwrap();
-    graph("RollbackForward", &ledger);
+    graph("RollbackForward", &mut ledger);
     assert_eq!(ledger.state().main, init_state);
 }
 
@@ -400,6 +400,6 @@ fn partial_forward() {
     println!("Applying {mid_opid2} and its descendants back");
     ledger.forward([mid_opid1]).unwrap();
     dump_ledger("tests/data/PartialForward.contract", "tests/data/PartialForward.dump", true).unwrap();
-    graph("PartialForward", &ledger);
+    graph("PartialForward", &mut ledger);
     assert_eq!(ledger.state().main, mid_state);
 }

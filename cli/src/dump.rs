@@ -90,7 +90,7 @@ pub fn dump_ledger(src: impl AsRef<Path>, dst: impl AsRef<Path>, force: bool) ->
 
     print!("Reading contract ledger from '{}' ... ", src.display());
     let path = src.to_path_buf();
-    let ledger = LedgerDir::load(path)?;
+    let mut ledger = LedgerDir::load(path)?;
     println!("success reading {}", ledger.contract_id());
 
     print!("Processing contract articles ... ");
@@ -123,7 +123,7 @@ pub fn dump_ledger(src: impl AsRef<Path>, dst: impl AsRef<Path>, force: bool) ->
     println!();
 
     print!("Processing trace ... none state transitions found");
-    for (no, (opid, st)) in ledger.trace().enumerate() {
+    for (no, (opid, st)) in ledger.trace_iter().enumerate() {
         let out = File::create_new(dst.join(format!("{:04}-trace-{opid}.yaml", no + 1)))?;
         serde_yaml::to_writer(&out, &st)?;
         print!("\rProcessing trace ... {} state transition processed", no + 1);
