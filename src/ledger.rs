@@ -1,25 +1,6 @@
 // SONIC: Standard library for formally-verifiable distributed contracts
 //
 // SPDX-License-Identifier: Apache-2.0
-//
-// Designed in 2019-2025 by Dr Maxim Orlovsky <orlovsky@ubideco.org>
-// Written in 2024-2025 by Dr Maxim Orlovsky <orlovsky@ubideco.org>
-//
-// Copyright (C) 2019-2024 LNP/BP Standards Association, Switzerland.
-// Copyright (C) 2024-2025 Laboratories for Ubiquitous Deterministic Computing (UBIDECO),
-//                         Institute for Distributed and Cognitive Systems (InDCS), Switzerland.
-// Copyright (C) 2019-2025 Dr Maxim Orlovsky.
-// All rights under the above copyrights are reserved.
-//
-// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
-// in compliance with the License. You may obtain a copy of the License at
-//
-//        http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software distributed under the License
-// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
-// or implied. See the License for the specific language governing permissions and limitations under
-// the License.
 
 use alloc::collections::BTreeSet;
 use core::borrow::Borrow;
@@ -36,28 +17,14 @@ use strict_encoding::{
 use ultrasonic::{AuthToken, CallError, CellAddr, ContractId, Identity, Issue, Operation, Opid, VerifiedOperation};
 
 use crate::deed::{CallParams, DeedBuilder};
-use crate::{Articles, EffectiveState, IssueError, ProcessedState, Stock, Transition};
+use crate::{Articles, EffectiveState, IssueError, ProcessedState, Stock, StockSession, Transition};
 
 pub const DEEDS_VERSION: u16 = 0;
 
-/// Contract with all its state and operations, supporting updates and rollbacks.
-// We need this structure to hide internal persistence methods and not to expose them.
-// We need the persistence trait (`Stock`) in order to allow different persistence storage
-// implementations.
 #[derive(Clone, Debug)]
-pub struct Ledger<S: Stock>(S, /** Cached value */ ContractId);
+pub struct Ledger<S: Stock>(S, ContractId);
 
 impl<S: Stock> Ledger<S> {
-    /// Instantiates a new contract from the provided articles, creating its persistence with the
-    /// provided configuration.
-    ///
-    /// # Panics
-    ///
-    /// This call must not panic, and instead must return an error.
-    ///
-    /// # Blocking I/O
-    ///
-    /// This call MAY perform any I/O operations.
     pub fn new(articles: Articles, conf: S::Conf) -> Result<Self, MultiError<IssueError, S::Error>> {
         let contract_id = articles.contract_id();
         let state = EffectiveState::with_articles(&articles)
@@ -65,20 +32,13 @@ impl<S: Stock> Ledger<S> {
             .map_err(MultiError::A)?;
         let mut stock = S::new(articles, state, conf).map_err(MultiError::B)?;
         let genesis_opid = stock.articles().genesis_opid();
-        stock.mark_valid(genesis_opid);
-        stock.commit_transaction();
+        let mut s = stock.session();
+        s.mark_valid(genesis_opid);
+        s.commit_transaction().map_err(MultiError::B)?;
+        drop(s);
         Ok(Self(stock, contract_id))
     }
 
-    /// Loads a contract using the provided configuration for persistence.
-    ///
-    /// # Panics
-    ///
-    /// This call must not panic, and instead must return an error.
-    ///
-    /// # Blocking I/O
-    ///
-    /// This call MAY perform any I/O operations.
     pub fn load(conf: S::Conf) -> Result<Self, S::Error> {
         S::load(conf).map(|stock| {
             let contract_id = stock.articles().contract_id();
@@ -87,238 +47,151 @@ impl<S: Stock> Ledger<S> {
     }
 
     pub fn config(&self) -> S::Conf { self.0.config() }
-
     pub fn stock(&self) -> &S { &self.0 }
 
-    /// Provides contract id.
-    ///
-    /// The contract id value is cached; thus, calling this operation is inexpensive.
-    ///
-    /// # Blocking I/O
-    ///
-    /// This call MUST NOT perform any I/O operations and MUST BE a non-blocking.
     #[inline]
     pub fn contract_id(&self) -> ContractId { self.1 }
-
-    /// Provides contract [`Articles`], which include contract genesis.
-    ///
-    /// # Blocking I/O
-    ///
-    /// This call MUST NOT perform any I/O operations and MUST BE a non-blocking.
     #[inline]
     pub fn articles(&self) -> &Articles { self.0.articles() }
-
-    /// Provides contract [`EffectiveState`].
-    ///
-    /// # Blocking I/O
-    ///
-    /// This call MUST NOT perform any I/O operations and MUST BE a non-blocking.
     #[inline]
     pub fn state(&self) -> &EffectiveState { self.0.state() }
 
-    /// Detects whether an operation with a given `opid` participates in the current state.
-    pub fn is_valid(&self, opid: Opid) -> bool { self.0.is_valid(opid) }
+    /// Opens a session and runs `f` with it, returning the result.
+    pub fn with_session<T, E>(&mut self, f: impl FnOnce(&mut S::Session<'_>) -> Result<T, E>) -> Result<T, E> {
+        let mut s = self.0.session();
+        f(&mut s)
+    }
 
-    /// Detects whether an operation with a given `opid` is known to the contract.
-    ///
-    /// # Nota bene
-    ///
-    /// Does not include genesis operation id.
-    ///
-    /// Positive response doesn't indicate that the operation participates in the current contract
-    /// state or in a current valid contract history, which may be exported.
-    ///
-    /// Operations may be excluded from the history due to rollbacks (see [`Ledger::rollback`]),
-    /// as well as re-included later with forwards (see [`Ledger::forward`]). In both cases
-    /// they are kept in the contract storage ("stash") and remain accessible to this method.
-    ///
-    /// # Blocking I/O
-    ///
-    /// This call MAY BE blocking.
-    #[inline]
-    pub fn has_operation(&self, opid: Opid) -> bool { self.0.has_operation(opid) }
+    pub fn is_valid(&mut self, opid: Opid) -> bool { self.0.session().is_valid(opid) }
 
-    /// Returns an operation ([`Operation`]) with a given `opid` from the set of known contract
-    /// operations ("stash").
-    ///
-    /// # Nota bene
-    ///
-    /// Does not include genesis operation.
-    ///
-    /// If the method returns an operation, this doesn't indicate that the operation participates in
-    /// the current contract state or in a current valid contract history, which/ may be exported.
-    ///
-    /// Operations may be excluded from the history due to rollbacks (see [`Ledger::rollback`]),
-    /// as well as re-included later with forwards (see [`Ledger::forward`]). In both cases
-    /// they are kept in the contract storage ("stash") and remain accessible to this method.
-    ///
-    /// # Panics
-    ///
-    /// If an `opid` is not present in the contract stash, or it corresponds to the genesis
-    /// operation.
-    ///
-    /// In order to avoid panics always call the method after calling `has_operation`.
-    ///
-    /// # Blocking I/O
-    ///
-    /// This call MAY BE blocking.
-    #[inline]
-    pub fn operation(&self, opid: Opid) -> Operation { self.0.operation(opid) }
+    pub fn has_operation(&mut self, opid: Opid) -> bool { self.0.session().has_operation(opid) }
 
-    /// Returns an iterator over all operations known to the contract (i.e., the complete contract
-    /// stash).
-    ///
-    /// # Nota bene
-    ///
-    /// Does not include genesis operation.
-    ///
-    /// Contract stash is a broader concept than contract history. It includes operations which may
-    /// not contribute to the current contract state or participate in the contract history, which
-    /// may be exported.
-    ///
-    /// Operations may be excluded from the history due to rollbacks (see [`Ledger::rollback`]),
-    /// as well as re-included later with forwards (see [`Ledger::forward`]). In both cases
-    /// they are kept in the contract storage ("stash") and remain accessible to this method.
-    ///
-    /// # Panics
-    ///
-    /// The method MUST NOT panic
-    ///
-    /// # Blocking I/O
-    ///
-    /// The iterator provided in return may be a blocking iterator.
-    #[inline]
-    pub fn operations(&self) -> impl Iterator<Item = (Opid, Operation)> + use<'_, S> { self.0.operations() }
+    pub fn operation(&mut self, opid: Opid) -> Operation { self.0.session().operation(opid) }
 
-    /// Returns an iterator over all state transitions known to the contract (i.e., the complete
-    /// contract trace).
-    ///
-    /// # Nota bene
-    ///
-    /// Contract trace is a broader concept than contract history. It includes state transition
-    /// which may not contribute to the current contract state or participate in the contract
-    /// history, which may be exported.
-    ///
-    /// State transitions may be excluded from the history due to rollbacks (see
-    /// [`Ledger::rollback`]), as well as re-included later with forwards (see
-    /// [`Ledger::forward`]). In both cases corresponding state transitions are kept in the
-    /// contract storage ("stash") and remain accessible to this method.
-    ///
-    /// # Panics
-    ///
-    /// The method MUST NOT panic
-    ///
-    /// # Blocking I/O
-    ///
-    /// The iterator provided in return may be a blocking iterator.
-    #[inline]
-    pub fn trace(&self) -> impl Iterator<Item = (Opid, Transition)> + use<'_, S> { self.0.trace() }
+    pub fn operations(&mut self) -> impl Iterator<Item = (Opid, Operation)> {
+        self.0
+            .session()
+            .operations()
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
 
-    #[inline]
-    pub fn read_by(&self, addr: CellAddr) -> impl Iterator<Item = Opid> + use<'_, S> { self.0.read_by(addr) }
-    #[inline]
-    pub fn spent_by(&self, addr: CellAddr) -> Option<Opid> { self.0.spent_by(addr) }
+    pub fn trace_iter(&mut self) -> impl Iterator<Item = (Opid, Transition)> {
+        self.0.session().trace().collect::<Vec<_>>().into_iter()
+    }
 
-    /// # Nota bene
-    ///
-    /// Ancestors do include the original operations
-    pub fn ancestors(&self, opids: impl IntoIterator<Item = Opid>) -> impl DoubleEndedIterator<Item = Opid> {
+    pub fn read_by(&mut self, addr: CellAddr) -> impl Iterator<Item = Opid> {
+        self.0
+            .session()
+            .read_by(addr)
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    pub fn spent_by(&mut self, addr: CellAddr) -> Option<Opid> { self.0.session().spent_by(addr) }
+
+    pub fn operation_count(&mut self) -> u64 { self.0.session().operation_count() }
+
+    pub fn transition(&mut self, opid: Opid) -> Transition { self.0.session().transition(opid) }
+
+    /// Ancestors include the original operations.
+    pub fn ancestors(&mut self, opids: impl IntoIterator<Item = Opid>) -> impl DoubleEndedIterator<Item = Opid> {
         let mut chain = opids.into_iter().collect::<IndexSet<_>>();
-        // Get all subsequent operations
+        let genesis_opid = self.0.articles().genesis_opid();
         let mut index = 0usize;
-        let genesis_opid = self.articles().genesis_opid();
-        while let Some(opid) = chain.get_index(index).copied() {
-            if opid != genesis_opid {
-                let op = self.0.operation(opid);
-                for inp in op.immutable_in {
-                    let parent = inp.opid;
-                    if !chain.contains(&parent) {
-                        chain.insert(parent);
+        self.with_session(|session| {
+            while let Some(opid) = chain.get_index(index).copied() {
+                if opid != genesis_opid {
+                    let op = session.operation(opid);
+                    for inp in op.immutable_in {
+                        if !chain.contains(&inp.opid) {
+                            chain.insert(inp.opid);
+                        }
+                    }
+                    for inp in op.destructible_in {
+                        if !chain.contains(&inp.addr.opid) {
+                            chain.insert(inp.addr.opid);
+                        }
                     }
                 }
-                for inp in op.destructible_in {
-                    let parent = inp.addr.opid;
-                    if !chain.contains(&parent) {
-                        chain.insert(parent);
-                    }
-                }
+                index += 1;
             }
-            index += 1;
-        }
+            Ok::<_, core::convert::Infallible>(())
+        })
+        .expect("infallible ancestors walk");
         chain.into_iter()
     }
 
-    /// # Nota bene
-    ///
-    /// Descendants do include the original operations
-    pub fn descendants(&self, opids: impl IntoIterator<Item = Opid>) -> impl DoubleEndedIterator<Item = Opid> {
+    /// Descendants include the original operations.
+    pub fn descendants(&mut self, opids: impl IntoIterator<Item = Opid>) -> impl DoubleEndedIterator<Item = Opid> {
         let mut chain = opids.into_iter().collect::<IndexSet<_>>();
-        // Get all subsequent operations
         let mut index = 0usize;
-        while let Some(opid) = chain.get_index(index).copied() {
-            let op = self.0.operation(opid);
-            for no in 0..op.immutable_out.len_u16() {
-                let addr = CellAddr::new(opid, no);
-                for read in self.0.read_by(addr) {
-                    if !chain.contains(&read) {
-                        chain.insert(read);
+        self.with_session(|session| {
+            while let Some(opid) = chain.get_index(index).copied() {
+                let op = session.operation(opid);
+                for no in 0..op.immutable_out.len_u16() {
+                    let addr = CellAddr::new(opid, no);
+                    for read in session.read_by(addr).collect::<Vec<_>>() {
+                        if !chain.contains(&read) {
+                            chain.insert(read);
+                        }
                     }
                 }
-            }
-            for no in 0..op.destructible_out.len_u16() {
-                let addr = CellAddr::new(opid, no);
-                let Some(spent) = self.0.spent_by(addr) else { continue };
-                if !chain.contains(&spent) {
-                    chain.insert(spent);
+                for no in 0..op.destructible_out.len_u16() {
+                    let addr = CellAddr::new(opid, no);
+                    if let Some(spent) = session.spent_by(addr) {
+                        if !chain.contains(&spent) {
+                            chain.insert(spent);
+                        }
+                    }
                 }
+                index += 1;
             }
-            index += 1;
-        }
+            Ok::<_, core::convert::Infallible>(())
+        })
+        .expect("infallible descendants walk");
         chain.into_iter()
     }
 
-    /// Exports contract with all known operations.
-    pub fn export_all(&self, writer: StrictWriter<impl WriteRaw>) -> io::Result<()> {
-        self.export_internal(self.0.operation_count() as u32, writer, |_| true, |_, _, w| Ok(w))
+    pub fn export_all(&mut self, writer: StrictWriter<impl WriteRaw>) -> io::Result<()> {
+        let count = self.0.session().operation_count() as u32;
+        self.export_internal(count, writer, |_| true, |_, _, w| Ok(w))
     }
 
-    /// Exports contract with all known operations with some auxiliary information returned by
-    /// `aux`.
     pub fn export_all_aux<W: WriteRaw>(
-        &self,
+        &mut self,
         writer: StrictWriter<W>,
         aux: impl FnMut(Opid, &Operation, StrictWriter<W>) -> io::Result<StrictWriter<W>>,
     ) -> io::Result<()> {
-        self.export_internal(self.0.operation_count() as u32, writer, |_| true, aux)
+        let count = self.0.session().operation_count() as u32;
+        self.export_internal(count, writer, |_| true, aux)
     }
 
-    /// Export a part of a contract history: a graph between a set of terminals and genesis.
     pub fn export(
-        &self,
+        &mut self,
         terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()> {
         self.export_aux(terminals, writer, |_, _, w| Ok(w))
     }
 
-    /// Exports contract and operations to a stream, extending operation data with some auxiliary
-    /// information returned by `aux`.
     pub fn export_aux<W: WriteRaw>(
-        &self,
+        &mut self,
         terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
         writer: StrictWriter<W>,
         aux: impl FnMut(Opid, &Operation, StrictWriter<W>) -> io::Result<StrictWriter<W>>,
     ) -> io::Result<()> {
         let mut queue = terminals
             .into_iter()
-            .map(|terminal| self.0.state().addr(*terminal.borrow()).opid)
+            .map(|t| self.0.state().addr(*t.borrow()).opid)
             .collect::<BTreeSet<_>>();
-        let articles = self.articles();
+        let articles = self.0.articles();
         let genesis_opid = articles.genesis_opid();
         queue.remove(&genesis_opid);
         let mut opids = queue.clone();
+
         while let Some(opid) = queue.pop_first() {
-            let st = self.0.transition(opid);
+            let st = self.0.session().transition(opid);
             for prev in st.destroyed.into_keys().map(|a| a.opid) {
                 if !opids.contains(&prev) && prev != genesis_opid {
                     opids.insert(prev);
@@ -327,8 +200,8 @@ impl<S: Stock> Ledger<S> {
             }
         }
 
-        // Include all operations defining published state
-        let state = self.state();
+        let state = self.0.state();
+        let articles = self.0.articles();
         let mut collect = |api: &Api, state: &ProcessedState| {
             for (state_name, owned) in &api.global {
                 if owned.published {
@@ -341,57 +214,37 @@ impl<S: Stock> Ledger<S> {
         };
         collect(&articles.semantics().default, &state.main);
         for (api_name, api) in &articles.semantics().custom {
-            let Some(state) = state.aux.get(api_name) else {
-                continue;
-            };
+            let Some(state) = state.aux.get(api_name) else { continue };
             collect(api, state);
         }
         opids.remove(&genesis_opid);
 
         self.export_internal(opids.len() as u32, writer, |opid| opids.remove(opid), aux)?;
 
-        debug_assert!(
-            opids.is_empty(),
-            "Missing operations: {}",
-            opids
-                .into_iter()
-                .map(|opid| opid.to_string())
-                .collect::<Vec<_>>()
-                .join("\n -")
-        );
-
+        debug_assert!(opids.is_empty());
         Ok(())
     }
 
-    /// Exports only operations for which `should_include` returns `true`.
-    ///
-    /// # Nota bene
-    ///
-    /// Does not write the contract id.
     pub fn export_internal<W: WriteRaw>(
-        &self,
+        &mut self,
         count: u32,
         mut writer: StrictWriter<W>,
         mut should_include: impl FnMut(&Opid) -> bool,
         mut aux: impl FnMut(Opid, &Operation, StrictWriter<W>) -> io::Result<StrictWriter<W>>,
     ) -> io::Result<()> {
-        let articles = self.articles();
+        let articles = self.0.articles();
         let genesis_opid = articles.genesis_opid();
+        let contract_id = self.1;
 
-        // Write version number
         writer = (DEEDS_VERSION as u8).strict_encode(writer)?;
-        // Write contract id
-        let contract_id = self.contract_id();
-        writer = self.contract_id().strict_encode(writer)?;
-        // Write an empty extension block
+        writer = contract_id.strict_encode(writer)?;
         writer = 0u8.strict_encode(writer)?;
-        // Write articles
         writer = articles.strict_encode(writer)?;
         writer = aux(genesis_opid, &articles.genesis().to_operation(contract_id), writer)?;
-        // Write no of operations
         writer = count.strict_encode(writer)?;
-        // Stream operations
-        for (opid, op) in self.0.operations() {
+
+        let ops: Vec<(Opid, Operation)> = self.0.session().operations().collect();
+        for (opid, op) in ops {
             if !should_include(&opid) {
                 continue;
             }
@@ -403,6 +256,7 @@ impl<S: Stock> Ledger<S> {
 
     pub fn upgrade_apis(&mut self, new_articles: Articles) -> Result<bool, MultiError<SemanticError, S::Error>> {
         self.0
+            .session()
             .update_articles(|articles| articles.upgrade_apis(new_articles))
     }
 
@@ -411,22 +265,15 @@ impl<S: Stock> Ledger<S> {
         reader: &mut StrictReader<impl ReadRaw>,
         sig_validator: impl FnOnce(StrictHash, &Identity, &SigBlob) -> Result<(), E>,
     ) -> Result<(), MultiError<AcceptError, S::Error>> {
-        // We need this closure to avoid multiple `map_err`.
         let count = (|| -> Result<u32, AcceptError> {
-            // Check version number
             let _ = ReservedBytes::<1, { DEEDS_VERSION as u8 }>::strict_decode(reader)?;
-
             let contract_id = ContractId::strict_decode(reader)?;
-
-            // Read and ignore the extension block
             let ext_blocks = u8::strict_decode(reader)?;
             for _ in 0..ext_blocks {
                 let len = u16::strict_decode(reader)?;
                 let r = unsafe { reader.raw_reader() };
                 let _ = r.read_raw::<{ u16::MAX as usize }>(len as usize)?;
             }
-
-            // Read articles
             let semantics = Semantics::strict_decode(reader)?;
             let sig = Option::<SigBlob>::strict_decode(reader)?;
             let issue = Issue::strict_decode(reader)?;
@@ -434,69 +281,95 @@ impl<S: Stock> Ledger<S> {
             if articles.contract_id() != contract_id {
                 return Err(AcceptError::Articles(SemanticError::ContractMismatch));
             }
-
             self.upgrade_apis(articles)
                 .map_err(|e| AcceptError::Persistence(e.to_string()))?;
-
-            let count = u32::strict_decode(reader)?;
-            Ok(count)
+            Ok(u32::strict_decode(reader)?)
         })()
         .map_err(MultiError::A)?;
 
-        // We need to account for genesis, which is not included in the `count`
         for _ in 0..=count {
             let op = match Operation::strict_decode(reader) {
-                Ok(operation) => operation,
+                Ok(o) => o,
                 Err(DecodeError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(MultiError::A(e.into())),
             };
             self.apply_verify(op, false)?;
         }
-        // Here we do not check for the end of the stream,
-        // so in the future we can have arbitrary extensions
-        // put here with no backward compatibility issues.
-        self.commit_transaction();
+        self.commit_transaction().map_err(MultiError::B)?;
         Ok(())
     }
 
     pub fn rollback(&mut self, opids: impl IntoIterator<Item = Opid>) -> Result<(), S::Error> {
-        for opid in self.descendants(opids).rev() {
-            let mut transition = self.0.transition(opid);
-            // We need to filter out already invalidated inputs
-            let inputs = transition
-                .destroyed
-                .keys()
-                .copied()
-                .collect::<IndexSet<_>>();
-            for addr in inputs {
-                if !self.is_valid(addr.opid) {
-                    // empty destroyed is allowed
-                    let _ = transition.destroyed.remove(&addr);
+        let desc: Vec<Opid> = self.descendants(opids).rev().collect();
+        let steps = self.with_session(|session| {
+            let mut steps = Vec::with_capacity(desc.len());
+            for &opid in &desc {
+                let mut transition = session.transition(opid);
+                let inputs: Vec<CellAddr> = transition.destroyed.keys().copied().collect();
+                for addr in inputs {
+                    if !session.is_valid(addr.opid) {
+                        let _ = transition.destroyed.remove(&addr);
+                    }
                 }
+                steps.push((opid, transition));
             }
-            self.0.update_state(|state, articles| {
+            Ok::<_, S::Error>(steps)
+        })?;
+
+        let mut s = self.0.session();
+        for (opid, transition) in steps {
+            s.update_state(|state, articles| {
                 state.rollback(transition, articles.semantics());
             })?;
-            self.0.mark_invalid(opid);
+            s.mark_invalid(opid);
         }
-        self.commit_transaction();
+        s.commit_transaction()?;
         Ok(())
     }
 
     pub fn forward(&mut self, opids: impl IntoIterator<Item = Opid>) -> Result<(), MultiError<AcceptError, S::Error>> {
-        for opid in self.descendants(opids) {
-            debug_assert!(!self.is_valid(opid));
-            if self
-                .ancestors([opid])
-                .filter(|id| *id != opid)
-                .all(|id| self.is_valid(id))
-            {
-                let op = self.0.operation(opid);
-                self.apply_verify(op, true)?;
-                debug_assert!(self.is_valid(opid));
-            }
+        let desc: Vec<Opid> = self.descendants(opids).collect();
+        let genesis_opid = self.0.articles().genesis_opid();
+        let eligible = self
+            .with_session(|session| {
+                let mut eligible = Vec::new();
+                for &opid in &desc {
+                    debug_assert!(!session.is_valid(opid));
+                    let mut chain = IndexSet::from([opid]);
+                    let mut index = 0usize;
+                    while let Some(current) = chain.get_index(index).copied() {
+                        if current != genesis_opid {
+                            let op = session.operation(current);
+                            for inp in op.immutable_in {
+                                if !chain.contains(&inp.opid) {
+                                    chain.insert(inp.opid);
+                                }
+                            }
+                            for inp in op.destructible_in {
+                                if !chain.contains(&inp.addr.opid) {
+                                    chain.insert(inp.addr.opid);
+                                }
+                            }
+                        }
+                        index += 1;
+                    }
+
+                    if chain
+                        .into_iter()
+                        .filter(|id| *id != opid)
+                        .all(|id| session.is_valid(id))
+                    {
+                        eligible.push(session.operation(opid));
+                    }
+                }
+                Ok::<_, S::Error>(eligible)
+            })
+            .map_err(MultiError::B)?;
+
+        for op in eligible {
+            self.apply_verify(op, true)?;
         }
-        self.commit_transaction();
+        self.commit_transaction().map_err(MultiError::B)?;
         Ok(())
     }
 
@@ -507,7 +380,6 @@ impl<S: Stock> Ledger<S> {
 
     pub fn call(&mut self, params: CallParams) -> Result<Opid, MultiError<AcceptError, S::Error>> {
         let mut builder = self.start_deed(params.core.method);
-
         for NamedState { name, state } in params.core.global {
             builder = builder.append(name, state.verified, state.unverified);
         }
@@ -518,29 +390,15 @@ impl<S: Stock> Ledger<S> {
             builder = builder.reading(addr);
         }
         for (addr, satisfaction) in params.using {
-            if let Some(satisfaction) = satisfaction {
-                builder = builder.satisfying(addr, satisfaction.name, satisfaction.witness);
+            if let Some(s) = satisfaction {
+                builder = builder.satisfying(addr, s.name, s.witness);
             } else {
                 builder = builder.using(addr);
             }
         }
-
         builder.commit()
     }
 
-    /// Adds operation which was already checked to the stock. This does the following:
-    /// - includes raw operation to stash;
-    /// - computes state modification and applies it to the state;
-    /// - saves removed state as a [`Transition`] and adds it to the execution trace.
-    ///
-    /// # Returns
-    ///
-    /// Whether the operation was already successfully included (`true`), or was already present in
-    /// the stash.
-    ///
-    /// # Nota bene
-    ///
-    /// It is required to call [`Self::commit_transaction`] after all calls to this method.
     pub fn apply_verify(
         &mut self,
         operation: Operation,
@@ -549,39 +407,25 @@ impl<S: Stock> Ledger<S> {
         if operation.contract_id != self.contract_id() {
             return Err(MultiError::A(AcceptError::Articles(SemanticError::ContractMismatch)));
         }
-
         let opid = operation.opid();
-
-        let present = self.0.is_valid(opid);
-        let articles = self.0.articles();
+        let present = self.0.session().is_valid(opid);
         if !present || force {
-            let verified = articles
+            let verified = self
+                .0
+                .articles()
                 .codex()
-                .verify(self.contract_id(), operation, &self.0.state().raw, articles)
+                .verify(self.contract_id(), operation, &self.0.state().raw, self.0.articles())
                 .map_err(AcceptError::from)
                 .map_err(MultiError::A)?;
             self.apply_internal(opid, verified, present && !force)
                 .map_err(MultiError::B)?;
         }
-
         Ok(present)
     }
 
-    /// Adds operation which was already checked to the stock. This does the following:
-    /// - includes raw operation to stash;
-    /// - computes state modification and applies it to the state;
-    /// - saves removed state as a [`Transition`] and adds it to the execution trace.
-    ///
-    /// # Returns
-    ///
-    /// State invalidated by the operation in the form of a [`Transition`].
-    ///
-    /// # Nota bene
-    ///
-    /// It is required to call [`Self::commit_transaction`] after all calls to this method.
     pub fn apply(&mut self, operation: VerifiedOperation) -> Result<Transition, S::Error> {
         let opid = operation.opid();
-        let present = self.0.is_valid(opid);
+        let present = self.0.session().is_valid(opid);
         self.apply_internal(opid, operation, present)
     }
 
@@ -591,28 +435,24 @@ impl<S: Stock> Ledger<S> {
         operation: VerifiedOperation,
         present: bool,
     ) -> Result<Transition, S::Error> {
+        let mut s = self.0.session();
         if !present {
-            self.0.add_operation(opid, operation.as_operation());
+            s.add_operation(opid, operation.as_operation());
         }
-
         let op = operation.as_operation();
         for read in &op.immutable_in {
-            self.0.add_reading(*read, opid);
+            s.add_reading(*read, opid);
         }
         for prevout in &op.destructible_in {
-            self.0.add_spending(prevout.addr, opid);
+            s.add_spending(prevout.addr, opid);
         }
-
-        let transition = self
-            .0
-            .update_state(|state, articles| state.apply(operation, articles.semantics()))?;
-
-        self.0.add_transition(opid, &transition);
-        self.0.mark_valid(opid);
+        let transition = s.update_state(|state, articles| state.apply(operation, articles.semantics()))?;
+        s.add_transition(opid, &transition);
+        s.mark_valid(opid);
         Ok(transition)
     }
 
-    pub fn commit_transaction(&mut self) { self.0.commit_transaction(); }
+    pub fn commit_transaction(&mut self) -> Result<(), S::Error> { self.0.session().commit_transaction() }
 }
 
 #[derive(Debug, Display, Error, From)]
@@ -620,21 +460,15 @@ impl<S: Stock> Ledger<S> {
 pub enum AcceptError {
     #[from]
     Io(io::Error),
-
     #[from]
     Articles(SemanticError),
-
     #[from]
     Verify(CallError),
-
     #[from]
     Decode(DecodeError),
-
     #[from]
     Serialize(SerializeError),
-
     Persistence(String),
-
     #[cfg(feature = "binfile")]
     #[display("Invalid file format")]
     InvalidFileFormat,
@@ -652,20 +486,18 @@ mod _fs {
     pub const DEEDS_MAGIC_NUMBER: u64 = u64::from_be_bytes(*b"DEEDLDGR");
 
     impl<S: Stock> Ledger<S> {
-        pub fn export_all_to_file(&self, output: impl AsRef<Path>) -> io::Result<()> {
+        pub fn export_all_to_file(&mut self, output: impl AsRef<Path>) -> io::Result<()> {
             let file = BinFile::<DEEDS_MAGIC_NUMBER, DEEDS_VERSION>::create_new(output)?;
-            let writer = StrictWriter::with(StreamWriter::new::<{ usize::MAX }>(file));
-            self.export_all(writer)
+            self.export_all(StrictWriter::with(StreamWriter::new::<{ usize::MAX }>(file)))
         }
 
         pub fn export_to_file(
-            &self,
+            &mut self,
             terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
             output: impl AsRef<Path>,
         ) -> io::Result<()> {
             let file = BinFile::<DEEDS_MAGIC_NUMBER, DEEDS_VERSION>::create_new(output)?;
-            let writer = StrictWriter::with(StreamWriter::new::<{ usize::MAX }>(file));
-            self.export(terminals, writer)
+            self.export(terminals, StrictWriter::with(StreamWriter::new::<{ usize::MAX }>(file)))
         }
 
         pub fn accept_from_file<E>(
