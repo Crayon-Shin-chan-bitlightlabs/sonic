@@ -25,7 +25,6 @@ use alloc::collections::BTreeSet;
 use core::borrow::Borrow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::time::Instant;
 
 use amplify::MultiError;
 use commit_verify::{ReservedBytes, StrictHash};
@@ -311,8 +310,6 @@ impl<S: Stock> Ledger<S> {
         writer: StrictWriter<W>,
         aux: impl FnMut(Opid, &Operation, StrictWriter<W>) -> io::Result<StrictWriter<W>>,
     ) -> io::Result<()> {
-        let export_start = Instant::now();
-        let queue_init_start = Instant::now();
         let initial_terminals = terminals
             .into_iter()
             .map(|terminal| self.0.state().addr(*terminal.borrow()).opid)
@@ -325,27 +322,8 @@ impl<S: Stock> Ledger<S> {
             .filter(|opid| *opid != genesis_opid)
             .collect::<VecDeque<_>>();
         let mut opids = queue.iter().copied().collect::<HashSet<_>>();
-        eprintln!(
-            "ledger.export_aux queue init for {} in {} seconds; initial_terminals={}, queue_after_genesis={}",
-            self.contract_id(),
-            queue_init_start.elapsed().as_secs_f64(),
-            initial_terminals.len(),
-            queue.len()
-        );
-
-        let trace_prewarm_start = Instant::now();
         let trace_by_opid = self.trace().collect::<HashMap<_, _>>();
-        eprintln!(
-            "ledger.export_aux trace prewarm for {} in {} seconds; trace_entries={}",
-            self.contract_id(),
-            trace_prewarm_start.elapsed().as_secs_f64(),
-            trace_by_opid.len()
-        );
-
-        let closure_walk_start = Instant::now();
-        let mut closure_iterations = 0usize;
         while let Some(opid) = queue.pop_front() {
-            closure_iterations += 1;
             let Some(st) = trace_by_opid.get(&opid) else {
                 continue;
             };
@@ -355,25 +333,15 @@ impl<S: Stock> Ledger<S> {
                 }
             }
         }
-        eprintln!(
-            "ledger.export_aux closure walk for {} in {} seconds; closure_iterations={}, opids_after_closure={}",
-            self.contract_id(),
-            closure_walk_start.elapsed().as_secs_f64(),
-            closure_iterations,
-            opids.len()
-        );
 
         // Include all operations defining published state
-        let published_state_start = Instant::now();
         let state = self.state();
-        let mut published_state_cells = 0usize;
         let mut collect = |api: &Api, state: &ProcessedState| {
             for (state_name, owned) in &api.global {
                 if owned.published {
                     let Some(cells) = state.global.get(state_name) else {
                         continue;
                     };
-                    published_state_cells += cells.len();
                     opids.extend(cells.keys().map(|addr| addr.opid));
                 }
             }
@@ -386,27 +354,7 @@ impl<S: Stock> Ledger<S> {
             collect(api, state);
         }
         opids.remove(&genesis_opid);
-        eprintln!(
-            "ledger.export_aux published state expansion for {} in {} seconds; published_state_cells={}, \
-             opids_after_published={}",
-            self.contract_id(),
-            published_state_start.elapsed().as_secs_f64(),
-            published_state_cells,
-            opids.len()
-        );
-
-        let export_internal_start = Instant::now();
         self.export_internal(opids.len() as u32, writer, |opid| opids.remove(opid), aux)?;
-        eprintln!(
-            "ledger.export_aux export_internal for {} in {} seconds",
-            self.contract_id(),
-            export_internal_start.elapsed().as_secs_f64()
-        );
-        eprintln!(
-            "ledger.export_aux total for {} in {} seconds",
-            self.contract_id(),
-            export_start.elapsed().as_secs_f64()
-        );
 
         debug_assert!(
             opids.is_empty(),
