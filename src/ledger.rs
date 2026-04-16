@@ -23,6 +23,7 @@
 
 use alloc::collections::BTreeSet;
 use core::borrow::Borrow;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::time::Instant;
 
@@ -312,32 +313,45 @@ impl<S: Stock> Ledger<S> {
     ) -> io::Result<()> {
         let export_start = Instant::now();
         let queue_init_start = Instant::now();
-        let mut queue = terminals
+        let initial_terminals = terminals
             .into_iter()
             .map(|terminal| self.0.state().addr(*terminal.borrow()).opid)
             .collect::<BTreeSet<_>>();
-        let initial_terminals = queue.len();
         let articles = self.articles();
         let genesis_opid = articles.genesis_opid();
-        queue.remove(&genesis_opid);
-        let mut opids = queue.clone();
+        let mut queue = initial_terminals
+            .iter()
+            .copied()
+            .filter(|opid| *opid != genesis_opid)
+            .collect::<VecDeque<_>>();
+        let mut opids = queue.iter().copied().collect::<HashSet<_>>();
         eprintln!(
             "ledger.export_aux queue init for {} in {} seconds; initial_terminals={}, queue_after_genesis={}",
             self.contract_id(),
             queue_init_start.elapsed().as_secs_f64(),
-            initial_terminals,
+            initial_terminals.len(),
             queue.len()
+        );
+
+        let trace_prewarm_start = Instant::now();
+        let trace_by_opid = self.trace().collect::<HashMap<_, _>>();
+        eprintln!(
+            "ledger.export_aux trace prewarm for {} in {} seconds; trace_entries={}",
+            self.contract_id(),
+            trace_prewarm_start.elapsed().as_secs_f64(),
+            trace_by_opid.len()
         );
 
         let closure_walk_start = Instant::now();
         let mut closure_iterations = 0usize;
-        while let Some(opid) = queue.pop_first() {
+        while let Some(opid) = queue.pop_front() {
             closure_iterations += 1;
-            let st = self.0.transition(opid);
-            for prev in st.destroyed.into_keys().map(|a| a.opid) {
-                if !opids.contains(&prev) && prev != genesis_opid {
-                    opids.insert(prev);
-                    queue.insert(prev);
+            let Some(st) = trace_by_opid.get(&opid) else {
+                continue;
+            };
+            for prev in st.destroyed.keys().map(|a| a.opid) {
+                if prev != genesis_opid && opids.insert(prev) {
+                    queue.push_back(prev);
                 }
             }
         }
