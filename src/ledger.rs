@@ -76,6 +76,14 @@ impl<S: Stock> Ledger<S> {
             .into_iter()
     }
 
+    pub fn valid_opids(&mut self) -> impl Iterator<Item = Opid> {
+        self.0
+            .session()
+            .valid_opids()
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
     pub fn operation_parent_ops(&mut self) -> impl Iterator<Item = (Opid, Vec<Opid>)> {
         self.0
             .session()
