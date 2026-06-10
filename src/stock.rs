@@ -45,6 +45,18 @@ pub trait StockSession {
     fn operation_count(&mut self) -> u64;
     fn operation(&mut self, opid: Opid) -> Operation;
     fn operations(&mut self) -> impl Iterator<Item = (Opid, Operation)>;
+    fn operation_parent_ops(&mut self) -> impl Iterator<Item = (Opid, Vec<Opid>)> {
+        self.operations()
+            .map(|(opid, op)| {
+                let parents = op
+                    .immutable_in
+                    .iter()
+                    .map(|inp| inp.opid)
+                    .chain(op.destructible_in.iter().map(|inp| inp.addr.opid))
+                    .collect();
+                (opid, parents)
+            })
+    }
     fn transition(&mut self, opid: Opid) -> Transition;
     fn trace(&mut self) -> impl Iterator<Item = (Opid, Transition)>;
     fn read_by(&mut self, addr: CellAddr) -> impl Iterator<Item = Opid>;
