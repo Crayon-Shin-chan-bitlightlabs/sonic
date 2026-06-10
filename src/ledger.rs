@@ -92,6 +92,14 @@ impl<S: Stock> Ledger<S> {
             .into_iter()
     }
 
+    pub fn operation_output_counts(&mut self) -> impl Iterator<Item = (Opid, u16)> {
+        self.0
+            .session()
+            .operation_output_counts()
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
     pub fn trace_iter(&mut self) -> impl Iterator<Item = (Opid, Transition)> {
         self.0.session().trace().collect::<Vec<_>>().into_iter()
     }

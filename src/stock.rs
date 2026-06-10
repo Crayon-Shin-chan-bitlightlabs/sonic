@@ -68,6 +68,10 @@ pub trait StockSession {
                 (opid, parents)
             })
     }
+    fn operation_output_counts(&mut self) -> impl Iterator<Item = (Opid, u16)> {
+        self.operations()
+            .map(|(opid, op)| (opid, op.destructible_out.len_u16()))
+    }
     fn transition(&mut self, opid: Opid) -> Transition;
     fn trace(&mut self) -> impl Iterator<Item = (Opid, Transition)>;
     fn read_by(&mut self, addr: CellAddr) -> impl Iterator<Item = Opid>;
