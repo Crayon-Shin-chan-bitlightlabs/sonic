@@ -46,15 +46,25 @@ impl<S: Stock> Ledger<S> {
         })
     }
 
-    pub fn config(&self) -> S::Conf { self.0.config() }
-    pub fn stock(&self) -> &S { &self.0 }
+    pub fn config(&self) -> S::Conf {
+        self.0.config()
+    }
+    pub fn stock(&self) -> &S {
+        &self.0
+    }
 
     #[inline]
-    pub fn contract_id(&self) -> ContractId { self.1 }
+    pub fn contract_id(&self) -> ContractId {
+        self.1
+    }
     #[inline]
-    pub fn articles(&self) -> &Articles { self.0.articles() }
+    pub fn articles(&self) -> &Articles {
+        self.0.articles()
+    }
     #[inline]
-    pub fn state(&self) -> &EffectiveState { self.0.state() }
+    pub fn state(&self) -> &EffectiveState {
+        self.0.state()
+    }
 
     /// Opens a session and runs `f` with it, returning the result.
     pub fn with_session<T, E>(&mut self, f: impl FnOnce(&mut S::Session<'_>) -> Result<T, E>) -> Result<T, E> {
@@ -62,11 +72,17 @@ impl<S: Stock> Ledger<S> {
         f(&mut s)
     }
 
-    pub fn is_valid(&mut self, opid: Opid) -> bool { self.0.session().is_valid(opid) }
+    pub fn is_valid(&mut self, opid: Opid) -> bool {
+        self.0.session().is_valid(opid)
+    }
 
-    pub fn has_operation(&mut self, opid: Opid) -> bool { self.0.session().has_operation(opid) }
+    pub fn has_operation(&mut self, opid: Opid) -> bool {
+        self.0.session().has_operation(opid)
+    }
 
-    pub fn operation(&mut self, opid: Opid) -> Operation { self.0.session().operation(opid) }
+    pub fn operation(&mut self, opid: Opid) -> Operation {
+        self.0.session().operation(opid)
+    }
 
     pub fn operations(&mut self) -> impl Iterator<Item = (Opid, Operation)> {
         self.0
@@ -76,28 +92,16 @@ impl<S: Stock> Ledger<S> {
             .into_iter()
     }
 
-    pub fn valid_opids(&mut self) -> impl Iterator<Item = Opid> {
-        self.0
-            .session()
-            .valid_opids()
-            .collect::<Vec<_>>()
-            .into_iter()
+    pub fn valid_opids(&mut self) -> Vec<Opid> {
+        self.0.session().valid_opids()
     }
 
-    pub fn operation_parent_ops(&mut self) -> impl Iterator<Item = (Opid, Vec<Opid>)> {
-        self.0
-            .session()
-            .operation_parent_ops()
-            .collect::<Vec<_>>()
-            .into_iter()
+    pub fn operation_parent_ops(&mut self) -> Vec<(Opid, Vec<Opid>)> {
+        self.0.session().operation_parent_ops()
     }
 
-    pub fn operation_output_counts(&mut self) -> impl Iterator<Item = (Opid, u16)> {
-        self.0
-            .session()
-            .operation_output_counts()
-            .collect::<Vec<_>>()
-            .into_iter()
+    pub fn operation_output_counts(&mut self) -> Vec<(Opid, u16)> {
+        self.0.session().operation_output_counts()
     }
 
     pub fn trace_iter(&mut self) -> impl Iterator<Item = (Opid, Transition)> {
@@ -112,11 +116,17 @@ impl<S: Stock> Ledger<S> {
             .into_iter()
     }
 
-    pub fn spent_by(&mut self, addr: CellAddr) -> Option<Opid> { self.0.session().spent_by(addr) }
+    pub fn spent_by(&mut self, addr: CellAddr) -> Option<Opid> {
+        self.0.session().spent_by(addr)
+    }
 
-    pub fn operation_count(&mut self) -> u64 { self.0.session().operation_count() }
+    pub fn operation_count(&mut self) -> u64 {
+        self.0.session().operation_count()
+    }
 
-    pub fn transition(&mut self, opid: Opid) -> Transition { self.0.session().transition(opid) }
+    pub fn transition(&mut self, opid: Opid) -> Transition {
+        self.0.session().transition(opid)
+    }
 
     /// Ancestors include the original operations.
     pub fn ancestors(&mut self, opids: impl IntoIterator<Item = Opid>) -> impl DoubleEndedIterator<Item = Opid> {
@@ -462,7 +472,9 @@ impl<S: Stock> Ledger<S> {
         Ok(transition)
     }
 
-    pub fn commit_transaction(&mut self) -> Result<(), S::Error> { self.0.session().commit_transaction() }
+    pub fn commit_transaction(&mut self) -> Result<(), S::Error> {
+        self.0.session().commit_transaction()
+    }
 }
 
 #[derive(Debug, Display, Error, From)]
