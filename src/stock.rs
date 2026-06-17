@@ -44,6 +44,7 @@ pub trait StockSession {
     fn has_operation(&mut self, opid: Opid) -> bool;
     fn operation_count(&mut self) -> u64;
     fn operation(&mut self, opid: Opid) -> Operation;
+    fn preload_operations(&mut self, _opids: impl IntoIterator<Item = Opid>) {}
     fn operations(&mut self) -> Vec<(Opid, Operation)>;
     fn valid_opids(&mut self) -> Vec<Opid> {
         let opids = self
@@ -77,6 +78,7 @@ pub trait StockSession {
             .collect()
     }
     fn transition(&mut self, opid: Opid) -> Transition;
+    fn preload_transitions(&mut self, _opids: impl IntoIterator<Item = Opid>) {}
     fn trace(&mut self) -> Vec<(Opid, Transition)>;
     fn read_by(&mut self, addr: CellAddr) -> Vec<Opid>;
     fn spent_by(&mut self, addr: CellAddr) -> Option<Opid>;
