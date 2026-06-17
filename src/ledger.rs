@@ -85,11 +85,7 @@ impl<S: Stock> Ledger<S> {
     }
 
     pub fn operations(&mut self) -> impl Iterator<Item = (Opid, Operation)> {
-        self.0
-            .session()
-            .operations()
-            .collect::<Vec<_>>()
-            .into_iter()
+        self.0.session().operations().into_iter()
     }
 
     pub fn valid_opids(&mut self) -> Vec<Opid> {
@@ -105,15 +101,11 @@ impl<S: Stock> Ledger<S> {
     }
 
     pub fn trace_iter(&mut self) -> impl Iterator<Item = (Opid, Transition)> {
-        self.0.session().trace().collect::<Vec<_>>().into_iter()
+        self.0.session().trace().into_iter()
     }
 
     pub fn read_by(&mut self, addr: CellAddr) -> impl Iterator<Item = Opid> {
-        self.0
-            .session()
-            .read_by(addr)
-            .collect::<Vec<_>>()
-            .into_iter()
+        self.0.session().read_by(addr).into_iter()
     }
 
     pub fn spent_by(&mut self, addr: CellAddr) -> Option<Opid> {
@@ -165,7 +157,7 @@ impl<S: Stock> Ledger<S> {
                 let op = session.operation(opid);
                 for no in 0..op.immutable_out.len_u16() {
                     let addr = CellAddr::new(opid, no);
-                    for read in session.read_by(addr).collect::<Vec<_>>() {
+                    for read in session.read_by(addr) {
                         if !chain.contains(&read) {
                             chain.insert(read);
                         }
@@ -277,7 +269,7 @@ impl<S: Stock> Ledger<S> {
         writer = aux(genesis_opid, &articles.genesis().to_operation(contract_id), writer)?;
         writer = count.strict_encode(writer)?;
 
-        let ops: Vec<(Opid, Operation)> = self.0.session().operations().collect();
+        let ops = self.0.session().operations();
         for (opid, op) in ops {
             if !should_include(&opid) {
                 continue;
