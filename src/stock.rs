@@ -45,18 +45,14 @@ pub trait StockSession {
     fn operation_count(&mut self) -> u64;
     fn operation(&mut self, opid: Opid) -> Operation;
     fn operations(&mut self) -> impl Iterator<Item = (Opid, Operation)>;
-    fn valid_opids(&mut self) -> impl Iterator<Item = Opid> {
-        let opids = self
-            .operations()
-            .map(|(opid, _)| opid)
-            .collect::<Vec<_>>();
-        let valid = opids
+    fn valid_opids(&mut self) -> Vec<Opid> {
+        let opids = self.operations().map(|(opid, _)| opid).collect::<Vec<_>>();
+        opids
             .into_iter()
             .filter(|opid| self.is_valid(*opid))
-            .collect::<Vec<_>>();
-        valid.into_iter()
+            .collect()
     }
-    fn operation_parent_ops(&mut self) -> impl Iterator<Item = (Opid, Vec<Opid>)> {
+    fn operation_parent_ops(&mut self) -> Vec<(Opid, Vec<Opid>)> {
         self.operations()
             .map(|(opid, op)| {
                 let parents = op
@@ -67,10 +63,12 @@ pub trait StockSession {
                     .collect();
                 (opid, parents)
             })
+            .collect()
     }
-    fn operation_output_counts(&mut self) -> impl Iterator<Item = (Opid, u16)> {
+    fn operation_output_counts(&mut self) -> Vec<(Opid, u16)> {
         self.operations()
             .map(|(opid, op)| (opid, op.destructible_out.len_u16()))
+            .collect()
     }
     fn transition(&mut self, opid: Opid) -> Transition;
     fn trace(&mut self) -> impl Iterator<Item = (Opid, Transition)>;
@@ -104,13 +102,16 @@ pub trait Stock {
     /// Session type for all I/O access.
     /// For lock-free backends: `type Session<'s> = &'s mut Self`.
     type Session<'s>: StockSession<Error = Self::Error>
-    where Self: 's;
+    where
+        Self: 's;
 
     fn new(articles: Articles, state: EffectiveState, conf: Self::Conf) -> Result<Self, Self::Error>
-    where Self: Sized;
+    where
+        Self: Sized;
 
     fn load(conf: Self::Conf) -> Result<Self, Self::Error>
-    where Self: Sized;
+    where
+        Self: Sized;
 
     fn config(&self) -> Self::Conf;
 
