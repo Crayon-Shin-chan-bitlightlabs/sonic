@@ -90,10 +90,10 @@ impl StockSession for &mut StockFs {
     fn has_operation(&mut self, opid: Opid) -> bool { self.stash.contains_key(opid) }
     fn operation_count(&mut self) -> u64 { self.stash.len() as u64 }
     fn operation(&mut self, opid: Opid) -> Operation { self.stash.get_expect(opid) }
-    fn operations(&mut self) -> impl Iterator<Item = (Opid, Operation)> { self.stash.iter() }
+    fn operations(&mut self) -> Vec<(Opid, Operation)> { self.stash.iter().collect() }
     fn transition(&mut self, opid: Opid) -> Transition { self.trace.get_expect(opid) }
-    fn trace(&mut self) -> impl Iterator<Item = (Opid, Transition)> { self.trace.iter() }
-    fn read_by(&mut self, addr: CellAddr) -> impl Iterator<Item = Opid> { self.read.get(addr) }
+    fn trace(&mut self) -> Vec<(Opid, Transition)> { self.trace.iter().collect() }
+    fn read_by(&mut self, addr: CellAddr) -> Vec<Opid> { self.read.get(addr).collect() }
     fn spent_by(&mut self, addr: CellAddr) -> Option<Opid> { self.spent.get(addr) }
 
     // ── write ─────────────────────────────────────────────────────────────
