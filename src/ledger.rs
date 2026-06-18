@@ -455,6 +455,12 @@ impl<S: Stock> Ledger<S> {
         self.apply_internal(opid, operation, present)
     }
 
+    pub fn apply_raw(&mut self, operation: VerifiedOperation) -> Result<Transition, S::Error> {
+        let opid = operation.opid();
+        let present = self.0.session().is_valid(opid);
+        self.apply_internal_raw(opid, operation, present)
+    }
+
     fn apply_internal(
         &mut self,
         opid: Opid,
@@ -476,6 +482,35 @@ impl<S: Stock> Ledger<S> {
         s.add_transition(opid, &transition);
         s.mark_valid(opid);
         Ok(transition)
+    }
+
+    fn apply_internal_raw(
+        &mut self,
+        opid: Opid,
+        operation: VerifiedOperation,
+        present: bool,
+    ) -> Result<Transition, S::Error> {
+        let mut s = self.0.session();
+        if !present {
+            s.add_operation(opid, operation.as_operation());
+        }
+
+        let op = operation.as_operation();
+        for read in &op.immutable_in {
+            s.add_reading(*read, opid);
+        }
+        for prevout in &op.destructible_in {
+            s.add_spending(prevout.addr, opid);
+        }
+
+        let transition = s.update_raw_state(|state, _| state.apply(operation))?;
+        s.add_transition(opid, &transition);
+        s.mark_valid(opid);
+        Ok(transition)
+    }
+
+    pub fn recompute_state(&mut self) -> Result<(), S::Error> {
+        self.0.session().recompute_state()
     }
 
     pub fn commit_transaction(&mut self) -> Result<(), S::Error> {

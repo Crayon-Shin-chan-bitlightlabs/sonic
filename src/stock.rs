@@ -27,7 +27,7 @@ use amplify::MultiError;
 use sonicapi::SemanticError;
 use ultrasonic::{CallError, CellAddr, ContractName, Operation, Opid};
 
-use crate::{Articles, EffectiveState, Transition};
+use crate::{Articles, EffectiveState, RawState, Transition};
 
 /// A session encapsulates all I/O access to a [`Stock`].
 ///
@@ -94,6 +94,18 @@ pub trait StockSession {
     ) -> Result<bool, MultiError<SemanticError, Self::Error>>;
 
     fn update_state<R>(&mut self, f: impl FnOnce(&mut EffectiveState, &Articles) -> R) -> Result<R, Self::Error>;
+
+    fn update_raw_state<R>(&mut self, f: impl FnOnce(&mut RawState, &Articles) -> R) -> Result<R, Self::Error> {
+        self.update_state(|state, articles| {
+            let res = f(&mut state.raw, articles);
+            state.recompute(articles.semantics());
+            res
+        })
+    }
+
+    fn recompute_state(&mut self) -> Result<(), Self::Error> {
+        self.update_state(|state, articles| state.recompute(articles.semantics()))
+    }
 
     fn add_operation(&mut self, opid: Opid, operation: &Operation);
     fn add_transition(&mut self, opid: Opid, transition: &Transition);
