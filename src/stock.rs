@@ -45,6 +45,15 @@ pub trait StockSession {
     fn operation_count(&mut self) -> u64;
     fn operation(&mut self, opid: Opid) -> Operation;
     fn preload_operations(&mut self, _opids: impl IntoIterator<Item = Opid>) {}
+    fn operation_batch(&mut self, opids: impl IntoIterator<Item = Opid>) -> Vec<(Opid, Operation)> {
+        let opids = opids.into_iter().collect::<Vec<_>>();
+        self.preload_operations(opids.iter().copied());
+
+        opids
+            .into_iter()
+            .map(|opid| (opid, self.operation(opid)))
+            .collect()
+    }
     fn operations(&mut self) -> Vec<(Opid, Operation)>;
     fn valid_opids(&mut self) -> Vec<Opid> {
         let opids = self
