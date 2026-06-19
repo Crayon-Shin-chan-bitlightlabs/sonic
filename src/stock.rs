@@ -57,6 +57,15 @@ pub trait StockSession {
             .filter(|opid| self.is_valid(*opid))
             .collect()
     }
+
+    /// Returns valid operation ids that are safe to use for fast-path duplicate
+    /// detection during consume.
+    ///
+    /// Backends with legacy validity indexes may override this to return only
+    /// opids backed by indexes maintained by a successful modern commit path.
+    /// Returning fewer opids preserves full-history verification semantics.
+    fn trusted_valid_opids(&mut self) -> Vec<Opid> { self.valid_opids() }
+
     fn operation_parent_ops(&mut self) -> Vec<(Opid, Vec<Opid>)> {
         self.operations()
             .into_iter()
