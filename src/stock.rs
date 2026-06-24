@@ -99,6 +99,17 @@ pub trait StockSession {
     fn add_transition(&mut self, opid: Opid, transition: &Transition);
     fn add_reading(&mut self, addr: CellAddr, reader: Opid);
     fn add_spending(&mut self, spent: CellAddr, spender: Opid);
+
+    /// Preloads backend duplicate-check lookups for operation data that may be staged during
+    /// [`Ledger::apply`](crate::Ledger::apply).
+    ///
+    /// The default implementation is a no-op. Database backends may override this to batch the
+    /// existence checks performed by [`Self::add_operation`], [`Self::add_transition`],
+    /// [`Self::add_spending`], and [`Self::mark_valid`] without changing de-duplication semantics.
+    fn preload_apply_insert_lookups<'a>(&mut self, operations: impl IntoIterator<Item = &'a Operation>) {
+        let _ = operations;
+    }
+
     fn commit_transaction(&mut self) -> Result<(), Self::Error>;
 }
 
@@ -110,16 +121,13 @@ pub trait Stock {
     /// Session type for all I/O access.
     /// For lock-free backends: `type Session<'s> = &'s mut Self`.
     type Session<'s>: StockSession<Error = Self::Error>
-    where
-        Self: 's;
+    where Self: 's;
 
     fn new(articles: Articles, state: EffectiveState, conf: Self::Conf) -> Result<Self, Self::Error>
-    where
-        Self: Sized;
+    where Self: Sized;
 
     fn load(conf: Self::Conf) -> Result<Self, Self::Error>
-    where
-        Self: Sized;
+    where Self: Sized;
 
     fn config(&self) -> Self::Conf;
 
