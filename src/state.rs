@@ -112,6 +112,24 @@ impl EffectiveState {
 
     /// Re-evaluates computable part of the state
     pub fn recompute(&mut self, apis: &Semantics) {
+        if defer_processed_state_apply() {
+            // With processed-state apply deferred, `main`/`aux` receive no per-op updates and
+            // aggregation alone cannot repair them (it only recomputes `aggregated` from the
+            // stale `global`): rebuild both from the raw state exactly the way `with_raw_state`
+            // does at load. Callers must invoke recompute at commit scope (not per-op) when the
+            // defer flag is on, or this O(state) rebuild multiplies.
+            self.main = ProcessedState::with(&self.raw, &apis.default, &apis.types);
+            self.main
+                .aggregate(&apis.default, &apis.api_libs, &apis.types);
+            self.aux = bmap! {};
+            for (name, api) in &apis.custom {
+                let mut state = ProcessedState::with(&self.raw, api, &apis.types);
+                state.aggregate(api, &apis.api_libs, &apis.types);
+                self.aux.insert(name.clone(), state);
+            }
+            return;
+        }
+
         self.main
             .aggregate(&apis.default, &apis.api_libs, &apis.types);
         self.aux = bmap! {};
@@ -137,6 +155,13 @@ impl EffectiveState {
     }
 
     pub(crate) fn rollback(&mut self, transition: Transition, apis: &Semantics) {
+        if defer_processed_state_apply() {
+            // `main`/`aux` were never applied under the defer flag; rolling them back would
+            // corrupt them. Rewind raw only and let the next recompute rebuild processed state.
+            self.raw.rollback(transition);
+            return;
+        }
+
         self.main.rollback(&transition, &apis.default, &apis.types);
         let mut count = 0usize;
         for (name, api) in &apis.custom {
