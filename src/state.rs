@@ -95,7 +95,10 @@ impl EffectiveState {
             let state = ProcessedState::with(&me.raw, api, articles.types());
             me.aux.insert(name.clone(), state);
         }
-        me.recompute(articles.semantics());
+        // Aggregate-only: `main`/`aux` were just rebuilt from raw above, so going through
+        // `recompute` would repeat the whole O(state) rebuild under the deferred-apply flag —
+        // on large replay states that doubles contract load time.
+        me.recompute_aggregates(articles.semantics());
         me
     }
 
@@ -130,6 +133,14 @@ impl EffectiveState {
             return;
         }
 
+        self.recompute_aggregates(apis);
+    }
+
+    /// Re-evaluates only the aggregated (computed) part of the state, assuming `main`/`aux`
+    /// global and owned maps are already current. This is the pre-deferred-apply `recompute`
+    /// body; callers that just rebuilt processed state from raw use it to skip the redundant
+    /// O(state) rebuild the deferred-apply flag adds to [`Self::recompute`].
+    fn recompute_aggregates(&mut self, apis: &Semantics) {
         self.main
             .aggregate(&apis.default, &apis.api_libs, &apis.types);
         self.aux = bmap! {};
