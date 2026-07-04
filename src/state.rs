@@ -22,6 +22,8 @@
 // the License.
 
 use alloc::collections::BTreeMap;
+use core::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 use aluvm::Lib;
 use amplify::confinement::{LargeOrdMap, SmallOrdMap, SmallOrdSet};
@@ -31,6 +33,20 @@ use strict_types::{StrictVal, TypeSystem};
 use ultrasonic::{AuthToken, CallError, CellAddr, Memory, Opid, StateCell, StateData, StateValue, VerifiedOperation};
 
 use crate::LIB_NAME_SONIC;
+
+fn defer_processed_state_apply() -> bool {
+    static ENABLED: OnceLock<AtomicBool> = OnceLock::new();
+    ENABLED
+        .get_or_init(|| {
+            AtomicBool::new(matches!(
+                std::env::var("RGB_EFFECTIVE_STATE_DEFER_PROCESSED_APPLY")
+                    .ok()
+                    .as_deref(),
+                Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+            ))
+        })
+        .load(Ordering::Relaxed)
+}
 
 /// State transitions keeping track of the operation reference plus the state destroyed by the
 /// operation.
@@ -108,6 +124,10 @@ impl EffectiveState {
 
     #[must_use]
     pub(crate) fn apply(&mut self, op: VerifiedOperation, apis: &Semantics) -> Transition {
+        if defer_processed_state_apply() {
+            return self.raw.apply(op);
+        }
+
         self.main.apply(&op, &apis.default, &apis.types);
         for (name, api) in &apis.custom {
             let state = self.aux.entry(name.clone()).or_default();
