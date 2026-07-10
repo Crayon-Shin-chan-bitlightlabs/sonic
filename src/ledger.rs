@@ -23,7 +23,7 @@
 
 use alloc::collections::BTreeSet;
 use core::borrow::Borrow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io;
 
 use amplify::MultiError;
@@ -280,7 +280,7 @@ impl<S: Stock> Ledger<S> {
 
     /// Exports contract with all known operations.
     pub fn export_all(&self, writer: StrictWriter<impl WriteRaw>) -> io::Result<()> {
-        self.export_internal(self.0.operation_count() as u32, writer, |_| true, |_, _, w| Ok(w))
+        self.export_all_aux(writer, |_, _, w| Ok(w))
     }
 
     /// Exports contract with all known operations with some auxiliary information returned by
@@ -290,7 +290,11 @@ impl<S: Stock> Ledger<S> {
         writer: StrictWriter<W>,
         aux: impl FnMut(Opid, &Operation, StrictWriter<W>) -> io::Result<StrictWriter<W>>,
     ) -> io::Result<()> {
-        self.export_internal(self.0.operation_count() as u32, writer, |_| true, aux)
+        let genesis_opid = self.articles().genesis_opid();
+        let operations = self.0.operations().collect::<Vec<_>>();
+        let seeds = operations.iter().map(|(opid, _)| *opid).collect::<Vec<_>>();
+        let ops = plan_export(operations, genesis_opid, seeds)?;
+        self.export_ordered(ops, writer, aux)
     }
 
     /// Export a part of a contract history: a graph between a set of terminals and genesis.
@@ -310,31 +314,16 @@ impl<S: Stock> Ledger<S> {
         writer: StrictWriter<W>,
         aux: impl FnMut(Opid, &Operation, StrictWriter<W>) -> io::Result<StrictWriter<W>>,
     ) -> io::Result<()> {
-        let initial_terminals = terminals
+        let articles = self.articles();
+        let genesis_opid = articles.genesis_opid();
+
+        // Seeds are terminals plus all operations defining published state. Both must be merged
+        // before computing the ancestor closure, so that ancestors of published-state operations
+        // are included in the consignment as well.
+        let mut seeds = terminals
             .into_iter()
             .map(|terminal| self.0.state().addr(*terminal.borrow()).opid)
             .collect::<BTreeSet<_>>();
-        let articles = self.articles();
-        let genesis_opid = articles.genesis_opid();
-        let mut queue = initial_terminals
-            .iter()
-            .copied()
-            .filter(|opid| *opid != genesis_opid)
-            .collect::<VecDeque<_>>();
-        let mut opids = queue.iter().copied().collect::<HashSet<_>>();
-        let trace_by_opid = self.trace().collect::<HashMap<_, _>>();
-        while let Some(opid) = queue.pop_front() {
-            let Some(st) = trace_by_opid.get(&opid) else {
-                continue;
-            };
-            for prev in st.destroyed.keys().map(|a| a.opid) {
-                if prev != genesis_opid && opids.insert(prev) {
-                    queue.push_back(prev);
-                }
-            }
-        }
-
-        // Include all operations defining published state
         let state = self.state();
         let mut collect = |api: &Api, state: &ProcessedState| {
             for (state_name, owned) in &api.global {
@@ -342,7 +331,7 @@ impl<S: Stock> Ledger<S> {
                     let Some(cells) = state.global.get(state_name) else {
                         continue;
                     };
-                    opids.extend(cells.keys().map(|addr| addr.opid));
+                    seeds.extend(cells.keys().map(|addr| addr.opid));
                 }
             }
         };
@@ -353,34 +342,28 @@ impl<S: Stock> Ledger<S> {
             };
             collect(api, state);
         }
-        opids.remove(&genesis_opid);
-        self.export_internal(opids.len() as u32, writer, |opid| opids.remove(opid), aux)?;
+        seeds.remove(&genesis_opid);
 
-        debug_assert!(
-            opids.is_empty(),
-            "Missing operations: {}",
-            opids
-                .into_iter()
-                .map(|opid| opid.to_string())
-                .collect::<Vec<_>>()
-                .join("\n -")
-        );
-
-        Ok(())
+        // Load the stash in one pass: resolving operations one by one may cause a separate
+        // storage query per operation on database-backed stocks.
+        let operations = self.0.operations().collect::<Vec<_>>();
+        let ops = plan_export(operations, genesis_opid, seeds)?;
+        self.export_ordered(ops, writer, aux)
     }
 
-    /// Exports only operations for which `should_include` returns `true`.
+    /// Writes a consignment stream containing the given operations in the given order.
     ///
-    /// # Nota bene
-    ///
-    /// Does not write the contract id.
-    pub fn export_internal<W: WriteRaw>(
+    /// The operation count is derived from `ops`, and all inclusion decisions are made by the
+    /// caller before any byte is written, so a failure can't leave a partially-written stream
+    /// with a wrong operation count.
+    fn export_ordered<W: WriteRaw>(
         &self,
-        count: u32,
+        ops: Vec<(Opid, Operation)>,
         mut writer: StrictWriter<W>,
-        mut should_include: impl FnMut(&Opid) -> bool,
         mut aux: impl FnMut(Opid, &Operation, StrictWriter<W>) -> io::Result<StrictWriter<W>>,
     ) -> io::Result<()> {
+        let count = u32::try_from(ops.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "too many operations to export"))?;
         let articles = self.articles();
         let genesis_opid = articles.genesis_opid();
 
@@ -397,10 +380,7 @@ impl<S: Stock> Ledger<S> {
         // Write no of operations
         writer = count.strict_encode(writer)?;
         // Stream operations
-        for (opid, op) in self.0.operations() {
-            if !should_include(&opid) {
-                continue;
-            }
+        for (opid, op) in ops {
             writer = op.strict_encode(writer)?;
             writer = aux(opid, &op, writer)?;
         }
@@ -621,6 +601,122 @@ impl<S: Stock> Ledger<S> {
     pub fn commit_transaction(&mut self) { self.0.commit_transaction(); }
 }
 
+/// Computes the list of operations to be exported into a consignment: the ancestor closure of
+/// `seeds`, followed both over destructible and immutable inputs, in a dependency-first order
+/// suitable for stream verification (a producer is always emitted before its consumers).
+///
+/// Operations unrelated by dependencies keep their relative order in `operations`. Genesis is not
+/// a part of the stash and is never included; references to it are skipped.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] when the stash is inconsistent and no valid consignment
+/// can be produced: a seed or a referenced parent operation is absent from `operations`, an opid
+/// occurs twice, or the dependency graph contains a cycle.
+fn plan_export(
+    operations: Vec<(Opid, Operation)>,
+    genesis_opid: Opid,
+    seeds: impl IntoIterator<Item = Opid>,
+) -> io::Result<Vec<(Opid, Operation)>> {
+    let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
+
+    let mut index_by_opid = HashMap::with_capacity(operations.len());
+    for (index, (opid, _)) in operations.iter().enumerate() {
+        if index_by_opid.insert(*opid, index).is_some() {
+            return Err(invalid(format!("duplicate operation {opid} in the contract stash")));
+        }
+    }
+
+    // Ancestor closure over both input types, using operation data as the source of truth
+    // (the trace may be incomplete, while inputs are commitment-verified parts of operations).
+    let mut included = vec![false; operations.len()];
+    let mut queue = VecDeque::new();
+    for seed in seeds {
+        if seed == genesis_opid {
+            continue;
+        }
+        let &index = index_by_opid
+            .get(&seed)
+            .ok_or_else(|| invalid(format!("operation {seed} is missing from the contract stash")))?;
+        if !included[index] {
+            included[index] = true;
+            queue.push_back(index);
+        }
+    }
+    let parents = |op: &Operation| {
+        op.destructible_in
+            .iter()
+            .map(|input| input.addr.opid)
+            .chain(op.immutable_in.iter().map(|addr| addr.opid))
+            .collect::<BTreeSet<_>>()
+    };
+    while let Some(index) = queue.pop_front() {
+        let (opid, op) = &operations[index];
+        for parent in parents(op) {
+            if parent == genesis_opid {
+                continue;
+            }
+            let &parent_index = index_by_opid.get(&parent).ok_or_else(|| {
+                invalid(format!(
+                    "operation {opid} references parent operation {parent} which is missing from the contract stash"
+                ))
+            })?;
+            if !included[parent_index] {
+                included[parent_index] = true;
+                queue.push_back(parent_index);
+            }
+        }
+    }
+
+    // Stable topological sort (Kahn's algorithm) over the included operations; the original
+    // position is the tie-breaker, so already-ordered stashes are exported unchanged.
+    let mut children = vec![Vec::new(); operations.len()];
+    let mut indegrees = vec![0usize; operations.len()];
+    for (index, (_, op)) in operations.iter().enumerate() {
+        if !included[index] {
+            continue;
+        }
+        for parent in parents(op) {
+            if parent == genesis_opid {
+                continue;
+            }
+            let parent_index = index_by_opid[&parent];
+            children[parent_index].push(index);
+            indegrees[index] += 1;
+        }
+    }
+    let mut ready = indegrees
+        .iter()
+        .enumerate()
+        .filter(|&(index, &indegree)| included[index] && indegree == 0)
+        .map(|(index, _)| index)
+        .collect::<BTreeSet<_>>();
+    let mut order = Vec::with_capacity(operations.len());
+    while let Some(index) = ready.pop_first() {
+        order.push(index);
+        for &child in &children[index] {
+            indegrees[child] -= 1;
+            if indegrees[child] == 0 {
+                ready.insert(child);
+            }
+        }
+    }
+    let included_count = included.iter().filter(|&&inc| inc).count();
+    if order.len() != included_count {
+        return Err(invalid(s!("contract stash contains a dependency cycle between operations")));
+    }
+
+    let mut slots = operations.into_iter().map(Some).collect::<Vec<_>>();
+    Ok(order
+        .into_iter()
+        .map(|index| {
+            slots[index]
+                .take()
+                .expect("topological order visits every operation once")
+        })
+        .collect())
+}
+
 #[derive(Debug, Display, Error, From)]
 #[display(inner)]
 pub enum AcceptError {
@@ -689,3 +785,163 @@ mod _fs {
 }
 #[cfg(feature = "binfile")]
 pub use _fs::*;
+
+#[cfg(test)]
+mod tests {
+    #![cfg_attr(coverage_nightly, coverage(off))]
+
+    use amplify::confinement::SmallVec;
+    use ultrasonic::{fe256, Input, StateValue};
+
+    use super::*;
+
+    fn contract_id() -> ContractId { ContractId::from([0xC0; 32]) }
+
+    /// Builds a real operation whose opid is its actual commitment id, so the test covers the
+    /// dependency extraction from `destructible_in`/`immutable_in` the same way export does.
+    fn make_op(nonce: u64, destructible: &[CellAddr], immutable: &[CellAddr]) -> (Opid, Operation) {
+        let mut destructible_in = SmallVec::new();
+        for addr in destructible {
+            destructible_in
+                .push(Input { addr: *addr, witness: StateValue::None })
+                .unwrap();
+        }
+        let mut immutable_in = SmallVec::new();
+        for addr in immutable {
+            immutable_in.push(*addr).unwrap();
+        }
+        let operation = Operation {
+            version: default!(),
+            contract_id: contract_id(),
+            call_id: 0,
+            nonce: fe256::from(nonce),
+            witness: StateValue::None,
+            destructible_in,
+            immutable_in,
+            destructible_out: none!(),
+            immutable_out: none!(),
+        };
+        (operation.opid(), operation)
+    }
+
+    fn genesis() -> Opid { make_op(u64::MAX, &[], &[]).0 }
+
+    fn opids(plan: &[(Opid, Operation)]) -> Vec<Opid> { plan.iter().map(|(opid, _)| *opid).collect() }
+
+    #[test]
+    fn destructible_consumer_stored_before_producer_is_reordered() {
+        let genesis = genesis();
+        let (a_id, a) = make_op(1, &[CellAddr::new(genesis, 0)], &[]);
+        let (b_id, b) = make_op(2, &[CellAddr::new(a_id, 0)], &[]);
+
+        let plan = plan_export(vec![(b_id, b), (a_id, a)], genesis, [b_id]).unwrap();
+        assert_eq!(opids(&plan), vec![a_id, b_id]);
+    }
+
+    #[test]
+    fn immutable_consumer_stored_before_producer_is_reordered() {
+        let genesis = genesis();
+        let (a_id, a) = make_op(1, &[CellAddr::new(genesis, 0)], &[]);
+        let (b_id, b) = make_op(2, &[CellAddr::new(genesis, 1)], &[CellAddr::new(a_id, 0)]);
+
+        let plan = plan_export(vec![(b_id, b), (a_id, a)], genesis, [b_id]).unwrap();
+        assert_eq!(opids(&plan), vec![a_id, b_id]);
+    }
+
+    #[test]
+    fn multi_level_reverse_order_is_reordered() {
+        let genesis = genesis();
+        let (a_id, a) = make_op(1, &[CellAddr::new(genesis, 0)], &[]);
+        let (b_id, b) = make_op(2, &[CellAddr::new(a_id, 0)], &[]);
+        let (c_id, c) = make_op(3, &[CellAddr::new(b_id, 0)], &[CellAddr::new(a_id, 1)]);
+
+        let plan = plan_export(vec![(c_id, c), (b_id, b), (a_id, a)], genesis, [c_id]).unwrap();
+        assert_eq!(opids(&plan), vec![a_id, b_id, c_id]);
+    }
+
+    #[test]
+    fn unrelated_operations_keep_stash_order() {
+        let genesis = genesis();
+        let (a_id, a) = make_op(1, &[CellAddr::new(genesis, 0)], &[]);
+        let (b_id, b) = make_op(2, &[CellAddr::new(genesis, 1)], &[]);
+        let (c_id, c) = make_op(3, &[CellAddr::new(genesis, 2)], &[]);
+
+        let plan = plan_export(vec![(c_id, c), (a_id, a), (b_id, b)], genesis, [c_id, a_id, b_id]).unwrap();
+        assert_eq!(opids(&plan), vec![c_id, a_id, b_id]);
+    }
+
+    #[test]
+    fn closure_excludes_operations_outside_seed_ancestry() {
+        let genesis = genesis();
+        let (a_id, a) = make_op(1, &[CellAddr::new(genesis, 0)], &[]);
+        let (b_id, b) = make_op(2, &[CellAddr::new(a_id, 0)], &[]);
+        let (c_id, c) = make_op(3, &[CellAddr::new(genesis, 1)], &[]);
+
+        let plan = plan_export(vec![(c_id, c), (b_id, b), (a_id, a)], genesis, [b_id]).unwrap();
+        assert_eq!(opids(&plan), vec![a_id, b_id]);
+    }
+
+    #[test]
+    fn seed_ancestors_are_traversed_through_both_input_types() {
+        // Models a published-state seed: the seed itself is not a terminal ancestor, but its own
+        // ancestors must still be exported.
+        let genesis = genesis();
+        let (a_id, a) = make_op(1, &[CellAddr::new(genesis, 0)], &[]);
+        let (b_id, b) = make_op(2, &[], &[CellAddr::new(a_id, 0)]);
+
+        let plan = plan_export(vec![(b_id, b), (a_id, a)], genesis, [b_id]).unwrap();
+        assert_eq!(opids(&plan), vec![a_id, b_id]);
+    }
+
+    #[test]
+    fn genesis_references_are_skipped() {
+        let genesis = genesis();
+        let (a_id, a) = make_op(1, &[CellAddr::new(genesis, 0)], &[CellAddr::new(genesis, 1)]);
+
+        let plan = plan_export(vec![(a_id, a)], genesis, [a_id]).unwrap();
+        assert_eq!(opids(&plan), vec![a_id]);
+    }
+
+    #[test]
+    fn missing_parent_fails_closed() {
+        let genesis = genesis();
+        let (a_id, _) = make_op(1, &[CellAddr::new(genesis, 0)], &[]);
+        let (b_id, b) = make_op(2, &[CellAddr::new(a_id, 0)], &[]);
+
+        let err = plan_export(vec![(b_id, b)], genesis, [b_id]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn missing_seed_fails_closed() {
+        let genesis = genesis();
+        let (a_id, a) = make_op(1, &[CellAddr::new(genesis, 0)], &[]);
+        let (b_id, _) = make_op(2, &[CellAddr::new(a_id, 0)], &[]);
+
+        let err = plan_export(vec![(a_id, a)], genesis, [b_id]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn dependency_cycle_fails_closed() {
+        // A cycle cannot occur with real commitment-derived opids; synthetic keys model a
+        // corrupted stash.
+        let genesis = genesis();
+        let k1 = Opid::from([0x01; 32]);
+        let k2 = Opid::from([0x02; 32]);
+        let (_, op1) = make_op(1, &[CellAddr::new(k2, 0)], &[]);
+        let (_, op2) = make_op(2, &[CellAddr::new(k1, 0)], &[]);
+
+        let err = plan_export(vec![(k1, op1), (k2, op2)], genesis, [k1]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn duplicate_opid_fails_closed() {
+        let genesis = genesis();
+        let (a_id, a) = make_op(1, &[CellAddr::new(genesis, 0)], &[]);
+
+        let err = plan_export(vec![(a_id, a.clone()), (a_id, a)], genesis, [a_id]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+}

@@ -489,7 +489,7 @@ mod test {
              endpoints=wss://127.0.0.1:8081,\
              storm://127.0.0.1:8082&endpoints=some_bullshit",
         )
-            .unwrap();
+        .unwrap();
         assert_eq!(s, req.to_string());
 
         assert_eq!(

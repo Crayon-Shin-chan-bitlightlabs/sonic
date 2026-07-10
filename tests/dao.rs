@@ -34,16 +34,18 @@ use std::path::Path;
 
 use aluvm::{CoreConfig, LibSite};
 use amplify::num::u256;
+use amplify::MultiError;
 use commit_verify::{Digest, Sha256, StrictHash};
-use hypersonic::{Api, GlobalApi, OwnedApi};
-use sonic_persist_fs::LedgerDir;
+use hypersonic::{Api, Articles, EffectiveState, GlobalApi, Ledger, OwnedApi, Stock, Transition};
+use sonic_persist_fs::{FsError, LedgerDir, StockFs};
 use sonicapi::{
-    Aggregator, Issuer, RawBuilder, RawConvertor, Semantics, SigBlob, StateArithm, StateBuilder, StateConvertor,
-    SubAggregator,
+    Aggregator, Issuer, RawBuilder, RawConvertor, SemanticError, Semantics, SigBlob, StateArithm, StateBuilder,
+    StateConvertor, SubAggregator,
 };
+use strict_encoding::{StreamWriter, StrictReader, StrictWriter};
 use strict_types::{SemId, StrictVal};
 use ultrasonic::aluvm::FIELD_ORDER_SECP;
-use ultrasonic::{AuthToken, CellAddr, Codex, Consensus, Identity};
+use ultrasonic::{AuthToken, CellAddr, Codex, Consensus, Identity, Operation, Opid};
 
 fn codex() -> Codex {
     let lib = libs::success();
@@ -273,7 +275,7 @@ fn main() {
         fs::remove_dir_all(contract_path).expect("Unable to remove a contract file");
     }
     fs::create_dir_all(contract_path).expect("Unable to create a contract folder");
-    let mut ledger2 = LedgerDir::new(articles, contract_path.to_path_buf()).expect("Can't issue contract");
+    let mut ledger2 = LedgerDir::new(articles.clone(), contract_path.to_path_buf()).expect("Can't issue contract");
     ledger2
         .accept_from_file(deeds_path, |_, _, _| Result::<_, Infallible>::Ok(()))
         .unwrap();
@@ -281,6 +283,98 @@ fn main() {
     let deeds_path = "tests/data/votings-all.deeds";
     fs::remove_file(deeds_path).ok();
     ledger2.export_all_to_file(deeds_path).unwrap();
+
+    // Database-backed stocks may enumerate operations consumer-first after a recovery or import
+    // (unlike the file stash, which preserves verification order). Emulate the worst case by
+    // reversing the enumeration order and check that both export flows still produce consignments
+    // acceptable to a fresh recipient.
+    let reversed = Ledger::<ReversedStock>::load(Path::new("tests/data/WonderlandDAO.contract").to_path_buf())
+        .expect("can't load contract with a reversed stash");
+    let mut mem = StreamWriter::in_memory::<{ usize::MAX }>();
+    reversed
+        .export_aux([alice_auth2, bob_auth2, carol_auth2], StrictWriter::with(&mut mem), |_, _, w| Ok(w))
+        .expect("can't export from a reversed stash");
+    let consignment = mem.unconfine();
+
+    let contract_path = Path::new("tests/data/WonderlandDAO-3.contract");
+    if contract_path.exists() {
+        fs::remove_dir_all(contract_path).expect("Unable to remove a contract file");
+    }
+    fs::create_dir_all(contract_path).expect("Unable to create a contract folder");
+    let mut recipient =
+        Ledger::<StockFs>::new(articles.clone(), contract_path.to_path_buf()).expect("Can't issue contract");
+    recipient
+        .accept(&mut StrictReader::in_memory::<{ usize::MAX }>(consignment), |_, _, _| Result::<_, Infallible>::Ok(()))
+        .expect("consignment exported from a reversed stash must be acceptable");
+
+    let mut mem = StreamWriter::in_memory::<{ usize::MAX }>();
+    reversed
+        .export_all_aux(StrictWriter::with(&mut mem), |_, _, w| Ok(w))
+        .expect("can't export all operations from a reversed stash");
+    let consignment = mem.unconfine();
+
+    let contract_path = Path::new("tests/data/WonderlandDAO-4.contract");
+    if contract_path.exists() {
+        fs::remove_dir_all(contract_path).expect("Unable to remove a contract file");
+    }
+    fs::create_dir_all(contract_path).expect("Unable to create a contract folder");
+    let mut recipient = Ledger::<StockFs>::new(articles, contract_path.to_path_buf()).expect("Can't issue contract");
+    recipient
+        .accept(&mut StrictReader::in_memory::<{ usize::MAX }>(consignment), |_, _, _| Result::<_, Infallible>::Ok(()))
+        .expect("full export from a reversed stash must be acceptable");
+}
+
+/// A [`StockFs`] wrapper which enumerates the stash in reverse order, so every consumer operation
+/// comes before its producer — the pathological case for consignment export.
+struct ReversedStock(StockFs);
+
+impl Stock for ReversedStock {
+    type Conf = std::path::PathBuf;
+    type Error = FsError;
+
+    fn new(articles: Articles, state: EffectiveState, conf: Self::Conf) -> Result<Self, Self::Error> {
+        StockFs::new(articles, state, conf).map(Self)
+    }
+
+    fn load(conf: Self::Conf) -> Result<Self, Self::Error> { StockFs::load(conf).map(Self) }
+
+    fn config(&self) -> Self::Conf { self.0.config() }
+    fn articles(&self) -> &Articles { self.0.articles() }
+    fn state(&self) -> &EffectiveState { self.0.state() }
+    fn is_valid(&self, opid: Opid) -> bool { self.0.is_valid(opid) }
+    fn mark_valid(&mut self, opid: Opid) { self.0.mark_valid(opid) }
+    fn mark_invalid(&mut self, opid: Opid) { self.0.mark_invalid(opid) }
+    fn has_operation(&self, opid: Opid) -> bool { self.0.has_operation(opid) }
+    fn operation_count(&self) -> u64 { self.0.operation_count() }
+    fn operation(&self, opid: Opid) -> Operation { self.0.operation(opid) }
+
+    fn operations(&self) -> impl Iterator<Item = (Opid, Operation)> {
+        let mut ops = self.0.operations().collect::<Vec<_>>();
+        ops.reverse();
+        ops.into_iter()
+    }
+
+    fn transition(&self, opid: Opid) -> Transition { self.0.transition(opid) }
+    fn trace(&self) -> impl Iterator<Item = (Opid, Transition)> { self.0.trace() }
+    fn read_by(&self, addr: CellAddr) -> impl Iterator<Item = Opid> { self.0.read_by(addr) }
+    fn spent_by(&self, addr: CellAddr) -> Option<Opid> { self.0.spent_by(addr) }
+
+    fn update_articles(
+        &mut self,
+        f: impl FnOnce(&mut Articles) -> Result<bool, SemanticError>,
+    ) -> Result<bool, MultiError<SemanticError, Self::Error>> {
+        self.0.update_articles(f)
+    }
+
+    fn update_state<R>(&mut self, f: impl FnOnce(&mut EffectiveState, &Articles) -> R) -> Result<R, Self::Error> {
+        self.0.update_state(f)
+    }
+
+    fn add_operation(&mut self, opid: Opid, operation: &Operation) { self.0.add_operation(opid, operation) }
+    fn add_transition(&mut self, opid: Opid, transition: &Transition) { self.0.add_transition(opid, transition) }
+    fn add_reading(&mut self, addr: CellAddr, reader: Opid) { self.0.add_reading(addr, reader) }
+    fn add_spending(&mut self, spent: CellAddr, spender: Opid) { self.0.add_spending(spent, spender) }
+    fn commit_transaction(&mut self) { self.0.commit_transaction() }
 }
 
 mod libs {
