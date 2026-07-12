@@ -34,6 +34,9 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9.34"
 toml = "0.8.22"
 
+[patch.crates-io]
+ultrasonic = { git = "https://github.com/Crayon-Shin-chan-bitlightlabs/ultrasonic.git", branch = "0.12-patch" }
+
 [package]
 name = "hypersonic"
 version.workspace = true
