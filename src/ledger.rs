@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use alloc::collections::BTreeSet;
+use alloc::sync::Arc;
 use core::borrow::Borrow;
 use std::io;
 
@@ -66,7 +67,9 @@ impl<S: Stock> Ledger<S> {
 
     pub fn has_operation(&mut self, opid: Opid) -> bool { self.0.session().has_operation(opid) }
 
-    pub fn operation(&mut self, opid: Opid) -> Operation { self.0.session().operation(opid) }
+    pub fn operation(&mut self, opid: Opid) -> Operation {
+        Arc::unwrap_or_clone(self.0.session().operation(opid))
+    }
 
     pub fn operations(&mut self) -> impl Iterator<Item = (Opid, Operation)> {
         self.0.session().operations().into_iter()
@@ -88,7 +91,9 @@ impl<S: Stock> Ledger<S> {
 
     pub fn operation_count(&mut self) -> u64 { self.0.session().operation_count() }
 
-    pub fn transition(&mut self, opid: Opid) -> Transition { self.0.session().transition(opid) }
+    pub fn transition(&mut self, opid: Opid) -> Transition {
+        Arc::unwrap_or_clone(self.0.session().transition(opid))
+    }
 
     /// Ancestors include the original operations.
     pub fn ancestors(&mut self, opids: impl IntoIterator<Item = Opid>) -> impl DoubleEndedIterator<Item = Opid> {
@@ -99,12 +104,12 @@ impl<S: Stock> Ledger<S> {
             while let Some(opid) = chain.get_index(index).copied() {
                 if opid != genesis_opid {
                     let op = session.operation(opid);
-                    for inp in op.immutable_in {
+                    for inp in &op.immutable_in {
                         if !chain.contains(&inp.opid) {
                             chain.insert(inp.opid);
                         }
                     }
-                    for inp in op.destructible_in {
+                    for inp in &op.destructible_in {
                         if !chain.contains(&inp.addr.opid) {
                             chain.insert(inp.addr.opid);
                         }
@@ -188,7 +193,7 @@ impl<S: Stock> Ledger<S> {
 
         while let Some(opid) = queue.pop_first() {
             let st = self.0.session().transition(opid);
-            for prev in st.destroyed.into_keys().map(|a| a.opid) {
+            for prev in st.destroyed.keys().map(|a| a.opid) {
                 if !opids.contains(&prev) && prev != genesis_opid {
                     opids.insert(prev);
                     queue.insert(prev);
@@ -300,14 +305,15 @@ impl<S: Stock> Ledger<S> {
         let mut session = self.0.session();
         for opid in desc {
             let mut transition = session.transition(opid);
-            let inputs: Vec<CellAddr> = transition.destroyed.keys().copied().collect();
+            let transition_mut = Arc::make_mut(&mut transition);
+            let inputs: Vec<CellAddr> = transition_mut.destroyed.keys().copied().collect();
             for addr in inputs {
                 if !session.is_valid(addr.opid) {
-                    let _ = transition.destroyed.remove(&addr);
+                    let _ = transition_mut.destroyed.remove(&addr);
                 }
             }
             session.update_state(|state, articles| {
-                state.rollback(transition, articles.semantics());
+                state.rollback(Arc::unwrap_or_clone(transition), articles.semantics());
             })?;
             session.mark_invalid(opid);
         }
@@ -326,12 +332,12 @@ impl<S: Stock> Ledger<S> {
             while let Some(current) = chain.get_index(index).copied() {
                 if current != genesis_opid {
                     let op = session.operation(current);
-                    for inp in op.immutable_in {
+                    for inp in &op.immutable_in {
                         if !chain.contains(&inp.opid) {
                             chain.insert(inp.opid);
                         }
                     }
-                    for inp in op.destructible_in {
+                    for inp in &op.destructible_in {
                         if !chain.contains(&inp.addr.opid) {
                             chain.insert(inp.addr.opid);
                         }
@@ -383,9 +389,10 @@ impl<S: Stock> Ledger<S> {
 
     pub fn apply_verify(
         &mut self,
-        operation: Operation,
+        operation: impl Into<Arc<Operation>>,
         force: bool,
     ) -> Result<bool, MultiError<AcceptError, S::Error>> {
+        let operation = operation.into();
         if operation.contract_id != self.contract_id() {
             return Err(MultiError::A(AcceptError::Articles(SemanticError::ContractMismatch)));
         }
@@ -423,7 +430,7 @@ impl<S: Stock> Ledger<S> {
     ) -> Result<Transition, S::Error> {
         let mut s = self.0.session();
         if !present {
-            s.add_operation(opid, operation.as_operation());
+            s.add_operation(opid, operation.operation_arc());
         }
         let op = operation.as_operation();
         for read in &op.immutable_in {

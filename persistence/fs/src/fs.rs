@@ -6,6 +6,7 @@ use std::convert::Infallible;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::{fs, io};
 
 use amplify::MultiError;
@@ -89,9 +90,9 @@ impl StockSession for &mut StockFs {
     fn is_valid(&mut self, opid: Opid) -> bool { self.valid.get(opid).map(bool::from).unwrap_or_default() }
     fn has_operation(&mut self, opid: Opid) -> bool { self.stash.contains_key(opid) }
     fn operation_count(&mut self) -> u64 { self.stash.len() as u64 }
-    fn operation(&mut self, opid: Opid) -> Operation { self.stash.get_expect(opid) }
+    fn operation(&mut self, opid: Opid) -> Arc<Operation> { Arc::new(self.stash.get_expect(opid)) }
     fn operations(&mut self) -> Vec<(Opid, Operation)> { self.stash.iter().collect() }
-    fn transition(&mut self, opid: Opid) -> Transition { self.trace.get_expect(opid) }
+    fn transition(&mut self, opid: Opid) -> Arc<Transition> { Arc::new(self.trace.get_expect(opid)) }
     fn trace(&mut self) -> Vec<(Opid, Transition)> { self.trace.iter().collect() }
     fn read_by(&mut self, addr: CellAddr) -> Vec<Opid> { self.read.get(addr).collect() }
     fn spent_by(&mut self, addr: CellAddr) -> Option<Opid> { self.spent.get(addr) }
@@ -130,7 +131,7 @@ impl StockSession for &mut StockFs {
         Ok(res)
     }
 
-    fn add_operation(&mut self, opid: Opid, op: &Operation) { self.stash.insert(opid, op) }
+    fn add_operation(&mut self, opid: Opid, op: Arc<Operation>) { self.stash.insert(opid, op.as_ref()) }
     fn add_transition(&mut self, opid: Opid, t: &Transition) { self.trace.insert(opid, t) }
     fn add_reading(&mut self, addr: CellAddr, reader: Opid) { self.read.push(addr, reader) }
     fn add_spending(&mut self, spent: CellAddr, spender: Opid) { self.spent.insert_or_update(spent, spender) }

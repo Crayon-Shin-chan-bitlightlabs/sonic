@@ -215,10 +215,10 @@ impl RawState {
     #[must_use]
     pub fn apply(&mut self, op: VerifiedOperation) -> Transition {
         let opid = op.opid();
-        let op = op.into_operation();
+        let op = op.as_operation();
         let mut transition = Transition::new(opid);
 
-        for input in op.destructible_in {
+        for input in &op.destructible_in {
             let res = self
                 .owned
                 .remove(&input.addr)
@@ -233,7 +233,7 @@ impl RawState {
             debug_assert!(res.is_none());
         }
 
-        for (no, cell) in op.destructible_out.into_iter().enumerate() {
+        for (no, cell) in op.destructible_out.iter().copied().enumerate() {
             let addr = CellAddr::new(opid, no as u16);
             self.auth
                 .insert(cell.auth, addr)
@@ -244,7 +244,8 @@ impl RawState {
         self.global
             .extend(
                 op.immutable_out
-                    .into_iter()
+                    .iter()
+                    .cloned()
                     .enumerate()
                     .map(|(no, data)| (CellAddr::new(opid, no as u16), data)),
             )

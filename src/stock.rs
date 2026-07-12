@@ -23,6 +23,7 @@
 
 use core::error::Error;
 
+use alloc::sync::Arc;
 use amplify::MultiError;
 use sonicapi::SemanticError;
 use ultrasonic::{CallError, CellAddr, ContractName, Operation, Opid};
@@ -43,7 +44,7 @@ pub trait StockSession {
     fn is_valid(&mut self, opid: Opid) -> bool;
     fn has_operation(&mut self, opid: Opid) -> bool;
     fn operation_count(&mut self) -> u64;
-    fn operation(&mut self, opid: Opid) -> Operation;
+    fn operation(&mut self, opid: Opid) -> Arc<Operation>;
     fn preload_operations(&mut self, _opids: impl IntoIterator<Item = Opid>) {}
     fn operations(&mut self) -> Vec<(Opid, Operation)>;
     fn valid_opids(&mut self) -> Vec<Opid> {
@@ -77,7 +78,7 @@ pub trait StockSession {
             .map(|(opid, op)| (opid, op.destructible_out.len_u16()))
             .collect()
     }
-    fn transition(&mut self, opid: Opid) -> Transition;
+    fn transition(&mut self, opid: Opid) -> Arc<Transition>;
     fn preload_transitions(&mut self, _opids: impl IntoIterator<Item = Opid>) {}
     fn trace(&mut self) -> Vec<(Opid, Transition)>;
     fn read_by(&mut self, addr: CellAddr) -> Vec<Opid>;
@@ -95,7 +96,7 @@ pub trait StockSession {
 
     fn update_state<R>(&mut self, f: impl FnOnce(&mut EffectiveState, &Articles) -> R) -> Result<R, Self::Error>;
 
-    fn add_operation(&mut self, opid: Opid, operation: &Operation);
+    fn add_operation(&mut self, opid: Opid, operation: Arc<Operation>);
     fn add_transition(&mut self, opid: Opid, transition: &Transition);
     fn add_reading(&mut self, addr: CellAddr, reader: Opid);
     fn add_spending(&mut self, spent: CellAddr, spender: Opid);
