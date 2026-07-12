@@ -71,6 +71,11 @@ impl<S: Stock> Ledger<S> {
         Arc::unwrap_or_clone(self.0.session().operation(opid))
     }
 
+    /// Shared-ownership variant of [`Self::operation`]: returns the reference-counted operation
+    /// without cloning the operation data. Use it when the operation is only read (e.g. to
+    /// inspect its output count) so the shared allocation is not deep-copied.
+    pub fn operation_arc(&mut self, opid: Opid) -> Arc<Operation> { self.0.session().operation(opid) }
+
     pub fn operations(&mut self) -> impl Iterator<Item = (Opid, Operation)> {
         self.0.session().operations().into_iter()
     }
